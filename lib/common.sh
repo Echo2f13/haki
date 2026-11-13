@@ -13,19 +13,43 @@ HAKI_YES=${HAKI_YES:-0}
 HAKI_STAMP=$(date +%Y%m%d-%H%M%S)
 
 # --- output ---------------------------------------------------------------------------------
-if [[ -t 1 ]]; then
-  C_B=$'\e[1m' C_DIM=$'\e[2m' C_RED=$'\e[31m' C_GRN=$'\e[32m' C_YEL=$'\e[33m' C_BLU=$'\e[34m' C_0=$'\e[0m'
+# The palette: sumi ink on paper. Four warm greys for text and the logo, one vermilion accent
+# (the colour of a hanko seal), and muted status colours that stay readable on dark and light
+# terminals. Truecolor by default; 256 colours on Apple Terminal or with HAKI_COLOR=256; the basic
+# 8 on the Linux console; none when output isn't a terminal or NO_COLOR is set (no-color.org).
+_rgb() { printf '\e[38;2;%d;%d;%dm' "0x${1:0:2}" "0x${1:2:2}" "0x${1:4:2}"; }
+if [[ -t 1 && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
+  C_B=$'\e[1m' C_0=$'\e[0m'
+  if [[ ${TERM:-} == linux ]]; then
+    C_INK1=$'\e[97m' C_INK2=$'\e[37m' C_INK3=$'\e[90m' C_INK4=$'\e[90m'
+    C_ACC=$'\e[31m' C_GRN=$'\e[32m' C_YEL=$'\e[33m' C_RED=$'\e[91m' C_SEAL=$'\e[97;41m'
+    C_LOGO1=$C_INK1 C_LOGO2=$C_INK1 C_LOGO3=$C_INK2 C_LOGO4=$C_INK2
+  elif [[ ${HAKI_COLOR:-} == 256 || ${TERM_PROGRAM:-} == Apple_Terminal ]]; then
+    C_INK1=$'\e[38;5;255m' C_INK2=$'\e[38;5;250m' C_INK3=$'\e[38;5;244m' C_INK4=$'\e[38;5;239m'
+    C_ACC=$'\e[38;5;167m' C_GRN=$'\e[38;5;108m' C_YEL=$'\e[38;5;179m' C_RED=$'\e[38;5;168m'
+    C_SEAL=$'\e[38;5;230;48;5;160m'
+    C_LOGO1=$'\e[38;5;255m' C_LOGO2=$'\e[38;5;252m' C_LOGO3=$'\e[38;5;248m' C_LOGO4=$'\e[38;5;245m'
+  else
+    C_INK1=$(_rgb ECE8E1) C_INK2=$(_rgb B9B3AA) C_INK3=$(_rgb 85807A) C_INK4=$(_rgb 55524E)
+    C_ACC=$(_rgb E25A3A) C_GRN=$(_rgb 93B874) C_YEL=$(_rgb E2A644) C_RED=$(_rgb D64561)
+    C_SEAL=$'\e[38;2;246;238;227;48;2;206;66;43m'
+    # the logo gets a brighter ramp than text, so the faint dry-brush tail still reads
+    C_LOGO1=$(_rgb ECE8E1) C_LOGO2=$(_rgb D4CEC5) C_LOGO3=$(_rgb ADA79E) C_LOGO4=$(_rgb 8C867E)
+  fi
 else
-  C_B='' C_DIM='' C_RED='' C_GRN='' C_YEL='' C_BLU='' C_0=''
+  C_B='' C_0='' C_INK1='' C_INK2='' C_INK3='' C_INK4='' C_ACC='' C_GRN='' C_YEL='' C_RED='' C_SEAL=''
+  C_LOGO1='' C_LOGO2='' C_LOGO3='' C_LOGO4=''
 fi
-title() { printf '\n%s%s%s\n' "$C_B" "$*" "$C_0"; }
-step()  { printf '%s==>%s %s\n' "$C_BLU" "$C_0" "$*"; }
+C_DIM=$C_INK3
+
+title() { printf '\n%s━━%s %s%s%s\n' "$C_ACC" "$C_0" "$C_B" "$*" "$C_0"; }
+step()  { printf '%s▸%s %s%s%s\n' "$C_ACC" "$C_0" "$C_B" "$*" "$C_0"; }
 ok()    { printf '  %s✓%s %s\n' "$C_GRN" "$C_0" "$*"; }
-skip()  { printf '  %s·%s %s\n' "$C_DIM" "$C_0" "$*"; }
+skip()  { printf '  %s· %s%s\n' "$C_INK3" "$*" "$C_0"; }
 warn()  { printf '  %s!%s %s\n' "$C_YEL" "$C_0" "$*" >&2; }
 bad()   { printf '  %s✗%s %s\n' "$C_RED" "$C_0" "$*"; }
-note()  { printf '    %s%s%s\n' "$C_DIM" "$*" "$C_0"; }
-plan()  { printf '  %s+%s %s\n' "$C_YEL" "$C_0" "$*"; }   # a change that would be made
+note()  { printf '    %s%s%s\n' "$C_INK3" "$*" "$C_0"; }
+plan()  { printf '  %s+%s %s\n' "$C_ACC" "$C_0" "$*"; }   # a change that would be made
 die()   { printf '%serror:%s %s\n' "$C_RED" "$C_0" "$*" >&2; exit 1; }
 
 planning() { [[ $HAKI_PLAN == 1 ]]; }

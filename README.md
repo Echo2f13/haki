@@ -57,6 +57,7 @@ Coming next, from the same server: an isolated network for hosting other people'
 ```text
 haki doctor                  check the host: Proxmox version, network, disks, SSH keys
 haki init                    detect your network and save /etc/haki/haki.conf
+haki                         the host at a glance: Proxmox, load, guests, modules, backups
 haki list                    all modules and whether they're installed
 haki info <module>           what it does, why, what it changes, its commands
 haki plan <module>...        dry run — list every change, apply nothing

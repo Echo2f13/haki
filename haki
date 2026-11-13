@@ -7,6 +7,8 @@ HAKI_ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 HAKI_VERSION=$(cat "$HAKI_ROOT/VERSION" 2>/dev/null || echo dev)
 # shellcheck source=lib/common.sh
 source "$HAKI_ROOT/lib/common.sh"
+# shellcheck source=lib/fetch.sh
+source "$HAKI_ROOT/lib/fetch.sh"
 
 # --- modules ----------------------------------------------------------------------------------
 module_names() { for d in "$HAKI_ROOT"/modules/*/; do [[ -f $d/module.sh ]] && basename "$d"; done; }
@@ -85,7 +87,7 @@ cmd_list() {
   local m state
   for m in $(module_names); do
     load_module "$m"
-    if module_installed "$m"; then state="${C_GRN}installed${C_0}"; else state="${C_DIM}available${C_0}"; fi
+    if module_installed "$m"; then state="${C_GRN}● installed${C_0}"; else state="${C_INK4}○ available${C_0}"; fi
     printf '  %-14s %-22s %s\n' "$m" "$state" "$MODULE_SUMMARY"
   done
   echo
@@ -225,8 +227,9 @@ for a in "$@"; do
 done
 set -- "${args[@]+"${args[@]}"}"
 
-cmd=${1:-help}; shift || true
+cmd=${1:-fetch}; shift || true
 case $cmd in
+  fetch)     cmd_fetch ;;
   help)      cmd_help "$@" ;;
   version)   echo "haki $HAKI_VERSION" ;;
   list)      cmd_list ;;
