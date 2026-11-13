@@ -46,3 +46,20 @@ Other files:
 
 After changing `HAKI_BACKUP_UUID` by hand, run `haki install backup-usb` so the plug-in trigger
 matches the new drive.
+
+## customer-net and tenant
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `HAKI_TENANT_BRIDGE` | `vmbr1` | The bridge for hosted guests. Must not exist in `/etc/network/interfaces`. |
+| `HAKI_TENANT_SUBNET` | `10.10.0.0/24` | Their network. A /24 that isn't your LAN; the host is `.1`. |
+| `HAKI_EDGE_IP` | empty | The one machine allowed to reach published apps (reverse proxy / tunnel). Set with `haki customer-net edge`. Empty = nothing is reachable. |
+| `HAKI_SNIPPET_STORAGE` | `local` | Directory storage for the isolation hookscript and container templates. |
+| `HAKI_TENANT_IDS` | `201-250` | Container ids for tenants. Id N gets IP `.(101 + N − first id)` and host port `20000+N`. |
+| `HAKI_TENANT_STORAGE` | auto (`local-lvm` / `local-zfs`) | Where their disks go. |
+| `HAKI_TENANT_TEMPLATE` | auto (newest Debian standard) | A template name from `pveam available`. |
+| `HAKI_TENANT_DNS` | `1.1.1.1 9.9.9.9` | DNS servers inside tenant containers. |
+
+Other files: `/etc/haki/plans.conf` (tenant plans, one per line) and `/etc/haki/ingress.conf`
+(published ports: `<host port> <container ip> <container port>`, managed by `haki tenant publish`).
+After changing the bridge or subnet, run `haki install customer-net` again.

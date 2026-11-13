@@ -33,7 +33,7 @@ EVENTS=$STATE/events.log
 REMIND_SECS=$((12 * 3600))
 BOOT_GRACE=300          # after boot, give guests this long before their checks count
 # Settings come from /etc/haki/haki.conf (written by `haki init`); empty means "skip that check".
-HAKI_BRIDGE=vmbr0 HAKI_SITE_URL="" HAKI_EDGE_VM="" HAKI_OLLAMA_VM="" HAKI_OLLAMA_PORT=11434
+HAKI_BRIDGE=vmbr0 HAKI_SITE_URL="" HAKI_EDGE_VM="" HAKI_EDGE_IP="" HAKI_OLLAMA_VM="" HAKI_OLLAMA_PORT=11434
 HAKI_REPORT_HOUR=9 HAKI_CONFIRM_RUNS=2
 [[ -r /etc/haki/haki.conf ]] && source /etc/haki/haki.conf
 BRIDGE=$HAKI_BRIDGE
@@ -345,13 +345,15 @@ for id in $(qm list | awk 'NR > 1 { print $1 }'); do
   fi
 done
 
-# Customer ports are only accepted from the edge VM's address hard-coded in haki-net.
-haki_edge=$(sed -n 's/^EDGE=\([0-9.]*\).*/\1/p' /usr/local/sbin/haki-net 2>/dev/null)
+# Published customer ports are only accepted from one address: HAKI_EDGE_IP (module customer-net),
+# or EDGE= in an older hand-installed haki-net.
+haki_edge=${HAKI_EDGE_IP:-}
+[[ -n $haki_edge ]] || haki_edge=$(sed -n 's/^EDGE=\([0-9.]*\).*/\1/p' /usr/local/sbin/haki-net 2>/dev/null)
 if [[ -n $EDGE_IP && -n $haki_edge ]]; then
   if [[ $EDGE_IP == "$haki_edge" ]]; then report haki-net-edge ok "haki-net points at the wrong edge address"
   else SEV=warn report haki-net-edge fail "haki-net points at the wrong edge address" \
          "The edge VM is at $EDGE_IP but haki-net only accepts customer traffic from $haki_edge, so published customer sites won't load." \
-         "Make the router keep the edge VM on $haki_edge, or set EDGE= in haki-net and run haki-net apply."; fi
+         "On the host: haki customer-net edge $EDGE_IP  (and give the edge VM a fixed address on the router)."; fi
 fi
 
 # --- containers and customer services ------------------------------------------------------

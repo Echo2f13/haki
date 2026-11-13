@@ -32,10 +32,16 @@ when something is wrong — and why.
 | [`backup-usb`](modules/backup-usb/module.sh) | Plug in a USB drive → every VM and container is backed up → the drive unmounts → unplug. Status in Proxmox Notes and Discord. |
 | [`nic-watchdog`](modules/nic-watchdog/module.sh) | Brings the host's network back when the router stops answering, without unplugging your VMs. |
 
-Coming next, from the same server: an isolated network for hosting other people's apps
-(`customer-net`, `tenant`), a public website behind Cloudflare Tunnel with no port forwarding
-(`edge`), an ollama API with GPU passthrough (`ollama-gpu`), and Obsidian sync over Tailscale
-(`notes-sync`).
+**Hosting other people's apps** — a friend's Discord bot, a small site, a side project:
+
+| Module | What it does |
+|---|---|
+| [`customer-net`](modules/customer-net/module.sh) | A separate network for guests you host. They get the internet and nothing else: not your LAN, not the host, not each other, no outbound mail. Only your reverse proxy / tunnel can reach a published app. |
+| [`tenant`](modules/tenant/module.sh) | `haki tenant new 202 priya-shop small` → an isolated container with its own IP and CPU/RAM/disk limits, starting on boot. Plus `list`, `publish`, `shell` and `remove`. |
+
+See [docs/hosting.md](docs/hosting.md). Coming next: a public website behind Cloudflare Tunnel
+with no port forwarding (`edge`), an ollama API with GPU passthrough (`ollama-gpu`), and Obsidian
+sync over Tailscale (`notes-sync`).
 
 ## How it works
 
@@ -89,6 +95,7 @@ web UI, or a screen and keyboard). See [docs/safety.md](docs/safety.md).
 - [Getting started](docs/getting-started.md) — a fresh Proxmox install to alerts in Discord
 - [Configuration](docs/config.md) — every setting in `/etc/haki/haki.conf`
 - [Safety](docs/safety.md) — what haki will and won't do, and how to undo it
+- [Hosting other people's apps](docs/hosting.md) — customer-net and tenant, step by step
 - [Writing a module](docs/writing-modules.md) — add your own building block
 
 ## License

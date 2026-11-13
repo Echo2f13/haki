@@ -91,7 +91,7 @@ cmd_list() {
     printf '  %-14s %-22s %s\n' "$m" "$state" "$MODULE_SUMMARY"
   done
   echo
-  note "Details: haki info <module>     Coming next: customer-net, tenant, edge, ollama-gpu, notes-sync"
+  note "Details: haki info <module>     Coming next: edge, ollama-gpu, notes-sync"
 }
 
 cmd_info() { [[ -n ${1:-} ]] || die "usage: haki info <module>"; print_module_info "$1"; }
@@ -227,6 +227,7 @@ for a in "$@"; do
 done
 set -- "${args[@]+"${args[@]}"}"
 
+load_config   # settings (and defaults) for every command, so module texts can use them
 cmd=${1:-fetch}; shift || true
 case $cmd in
   fetch)     cmd_fetch ;;
