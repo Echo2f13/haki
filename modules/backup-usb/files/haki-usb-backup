@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# haki-usb-backup — back up every VM plus host config to the USB drive's Server folder
+# when it is plugged in, then unmount so the drive can be unplugged.
+#   haki-usb-backup            run a backup (started by udev on plug-in)
+#   haki-usb-backup --now      run a backup even if one succeeded in the last 12 h
+#   haki-usb-backup --status   refresh the status line in Notes (daily timer)
+#
+# The drive must contain a top-level "Server" folder: the script never writes anywhere else, so it
+# can't fill or damage a drive you didn't prepare for it. Installed by `haki install backup-usb`.
+cd /
+set -euo pipefail
+
+# Settings come from /etc/haki/haki.conf (written by `haki backup-usb pick`).
+HAKI_BACKUP_UUID="" HAKI_BACKUP_KEEP=4 HAKI_BACKUP_MIN_FREE_GB=150 HAKI_BACKUP_DUE_DAYS=7
+[[ -r /etc/haki/haki.conf ]] && source /etc/haki/haki.conf
+UUID=$HAKI_BACKUP_UUID
+[[ -n $UUID ]] || { echo "haki-usb-backup: no drive chosen yet (run: haki backup-usb pick)" >&2; exit 1; }
+MNT=/mnt/haki-usb-backup
+DIR="$MNT/Server/proxmox"
+KEEP=$HAKI_BACKUP_KEEP          # backups kept per guest
+MIN_FREE_GB=$HAKI_BACKUP_MIN_FREE_GB  # never let backups push the drive below this
+MIN_GAP_HOURS=12       # skip if a backup succeeded this recently (e.g. reboot with drive attached)
+DUE_DAYS=$HAKI_BACKUP_DUE_DAYS
+STATE=/var/lib/haki-backup
+LOCK=/run/lock/haki-usb-backup.lock
+NODE=$(hostname)
+
+log() { echo "haki-usb-backup: $*"; }
+
+RUNLOG=$STATE/last-run.log
+STARTED=$(date +%s)
+DONE=0
+
+# notify <level> <title> <text> [name=value ...]: a Discord card through haki-watch (queued if
+# the internet is down). Never fails the backup.
+notify() { # Discord cards go through haki-watch when the "watch" module is installed
+  [[ -x /usr/local/sbin/haki-watch ]] || return 0
+  /usr/local/sbin/haki-watch --notify "$@" >/dev/null 2>&1 || log "Discord card failed: $2"
+}
+hm() { date -d "@$1" '+%d %b %H:%M'; }
+mins() { echo "$(( ($1 + 59) / 60 )) min"; }
+
+# Put the status line at the top of both Notes panels (Datacenter and node), keeping other text.
+set_notes() {
+  local line="$1" path cur
+  for path in /cluster/options "/nodes/$NODE/config"; do
+    cur=$(pvesh get "$path" --output-format json \
+          | perl -CO -MJSON -0e 'print decode_json(<STDIN>)->{description} // ""')
+    cur=$(printf '%s' "$cur" | grep -v '^\*\*USB backup' || true)
+    pvesh set "$path" --description "$line"$'\n\n'"$cur" || log "could not update Notes at $path"
+  done
+}
+
+refresh_status() {
+  local last now age_days due
+  if [[ ! -s $STATE/last-success ]]; then
+    set_notes "**USB backup:** none yet — plug in the backup drive."
+    return
+  fi
+  last=$(cat "$STATE/last-success")
+  now=$(date +%s)
+  age_days=$(( (now - last) / 86400 ))
+  due=$(date -d "@$(( last + DUE_DAYS * 86400 ))" '+%a %d %b')
+  if (( age_days >= DUE_DAYS )); then
+    set_notes "**USB backup: OVERDUE** — last one $(date -d "@$last" '+%d %b %H:%M') ($age_days days ago). Plug in the backup drive."
+  else
+    set_notes "**USB backup:** last OK $(date -d "@$last" '+%d %b %H:%M'), next due $due."
+  fi
+}
+
+if [[ ${1:-} == --status ]]; then refresh_status; exit 0; fi
+
+exec 9>"$LOCK"
+flock -n 9 || { log "a backup is already running"; exit 0; }
+mkdir -p "$STATE" "$MNT"
+
+# Skip a recent re-plug, but never right after a failed attempt.
+if [[ ${1:-} != --now && -s $STATE/last-success ]] && (( $(date +%s) - $(cat "$STATE/last-success") < MIN_GAP_HOURS * 3600 )) \
+   && (( $(cat "$STATE/last-failure" 2>/dev/null || echo 0) < $(cat "$STATE/last-success") )); then
+  log "last backup was under ${MIN_GAP_HOURS}h ago; skipping"
+  notify info "Backup drive connected — skipped" \
+    "The last good backup was $(hm "$(cat "$STATE/last-success")"), under ${MIN_GAP_HOURS} h ago, so nothing was written. Safe to unplug." \
+    "Force one=haki-usb-backup --now"
+  exit 0
+fi
+
+# guest_lines <pattern>: "VM 100, VM 101" from the vzdump output of this run.
+guest_lines() { grep -oE "$1 [0-9]+" "$RUNLOG" 2>/dev/null | awk '{ print "VM " $NF }' | sort -u | paste -sd, - | sed 's/,/, /g'; }
+
+finish() {
+  local rc=$? took reason ok failed
+  set +e
+  sync
+  if mountpoint -q "$MNT"; then umount "$MNT" && log "drive unmounted — safe to unplug"; fi
+  took=$(mins $(( $(date +%s) - STARTED )))
+  if (( rc == 0 && DONE == 1 )); then
+    notify ok "Backup finished — safe to unplug" \
+      "Every guest and the host config are on the drive, and it has been unmounted." \
+      "Took=$took" "Written=${WRITTEN:-?}" "Drive free=${FREE:-?}" \
+      "Backed up=$(guest_lines 'Finished Backup of VM')" "+Kept=$KEEP newest copies of each; older ones pruned."
+  elif (( rc != 0 )); then
+    date +%s > "$STATE/last-failure"
+    reason="See: journalctl -u haki-usb-backup"
+    if [[ ! -e /dev/disk/by-uuid/$UUID ]]; then
+      reason="**The drive disconnected during the backup** — unplugged too early, a loose cable, or the drive lost power. Plug it back in to retry."
+    elif grep -q 'Input/output error' "$RUNLOG" 2>/dev/null; then
+      reason="**The drive reported write errors.** Check the cable/port; if it repeats, the drive may be failing."
+    fi
+    set_notes "**USB backup: FAILED** at $(date '+%d %b %H:%M') — last good one $( [[ -s $STATE/last-success ]] && hm "$(cat "$STATE/last-success")" || echo never). See: journalctl -u haki-usb-backup"
+    ok=$(guest_lines 'Finished Backup of VM'); failed=$(guest_lines 'ERROR: Backup of VM')
+    notify down "Backup FAILED" "$reason" \
+      "Ran for=$took" "Saved=${ok:-nothing}" "Failed=${failed:-—}" \
+      "Last good backup=$( [[ -s $STATE/last-success ]] && hm "$(cat "$STATE/last-success")" || echo never)" \
+      "+Details=journalctl -u haki-usb-backup -n 80"
+  fi
+}
+trap finish EXIT
+
+sleep 5 # let the drive settle after plug-in
+mountpoint -q "$MNT" || mount -o noatime "UUID=$UUID" "$MNT"
+[[ -d $MNT/Server ]] || { log "no Server folder on the drive; refusing to write (haki backup-usb pick creates it)"; exit 1; }
+mkdir -p "$DIR"
+
+free_gb=$(df --output=avail -BG "$MNT" | tail -1 | tr -dc '0-9')
+(( free_gb >= MIN_FREE_GB )) || { log "only ${free_gb} GB free on the drive (minimum ${MIN_FREE_GB})"; exit 1; }
+
+set_notes "**USB backup: RUNNING** since $(date '+%d %b %H:%M') — don't unplug the drive."
+notify info "Backup started — don't unplug the drive" \
+  "Backing up every guest and the host config. Wait for the \"safe to unplug\" card (usually 5–10 min)." \
+  "Drive free=${free_gb} GB" "Last good backup=$( [[ -s $STATE/last-success ]] && hm "$(cat "$STATE/last-success")" || echo never)"
+
+# Leftovers from an interrupted run (vzdump writes *.dat / *.tmp, then renames when done).
+find "$DIR" -maxdepth 1 -type f \( -name 'vzdump-*.dat' -o -name 'vzdump-*.tmp' \) -print -delete \
+  | sed 's/^/haki-usb-backup: removed partial file /' || true
+
+log "backing up host config"
+tar -czf "$DIR/host-config-$(date +%Y_%m_%d-%H_%M_%S).tar.gz" \
+  /etc/pve /etc/network/interfaces /etc/hosts /etc/hostname /etc/fstab \
+  /etc/udev/rules.d /etc/systemd/system /usr/local/sbin /etc/modprobe.d /etc/default/grub 2>/dev/null || true
+
+log "backing up all VMs"
+vzdump --all 1 --mode snapshot --compress zstd --dumpdir "$DIR" --mailnotification failure 2>&1 | tee "$RUNLOG"
+
+# Keep the newest $KEEP of each backup type; only ever delete files this script created.
+prune() {
+  local pattern="$1" f
+  mapfile -t old < <(find "$DIR" -maxdepth 1 -type f -name "$pattern" -printf '%f\n' | sort -r | tail -n +$((KEEP + 1)))
+  for f in "${old[@]}"; do
+    rm -f -- "$DIR/$f" "$DIR/${f%%.*}.log" "$DIR/${f%%.*}.notes"
+    log "pruned $f"
+  done
+}
+for id in $(qm list | awk 'NR > 1 { print $1 }'); do prune "vzdump-qemu-$id-*.vma.zst"; done
+for id in $(pct list | awk 'NR > 1 { print $1 }'); do prune "vzdump-lxc-$id-*.tar.zst"; done
+prune 'host-config-*.tar.gz'
+
+date +%s > "$STATE/last-success"
+refresh_status
+log "backup complete"
+WRITTEN=$(find "$DIR" -maxdepth 1 -type f -newermt "@$STARTED" -printf '%s\n' | awk '{ s += $1 } END { printf "%.1f GB", s / 1e9 }') || true
+FREE=$(df -h --output=avail "$MNT" | tail -1 | tr -d ' ') || true
+DONE=1 # finish() unmounts, then posts the "safe to unplug" card

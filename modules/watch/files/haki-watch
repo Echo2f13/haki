@@ -1,0 +1,410 @@
+#!/usr/bin/env bash
+# haki-watch — health checks for a Proxmox host, its guests and services (every 2 min),
+# reported to Discord as colour-coded cards.
+#
+#   DOWN        a check failed CONFIRM runs in a row (one-off blips are logged, not alerted)
+#   STILL DOWN  reminder every 12 h while it stays failed
+#   RECOVERED   back to normal, with how long it was down
+#   ONLINE      first run after a boot: how long the server was off and whether it was a
+#               clean shutdown or a power cut / crash
+#   NOTICE      a guest's LAN address changed, the edge address no longer matches haki-net, ...
+#   DAILY       once a day after REPORT_HOUR: everything at a glance, plus last 24 h of incidents
+#
+# Messages that can't be sent (home internet down) are queued and sent when it comes back.
+# Guests are found by MAC address, so checks keep working when the router hands out a new IP.
+#
+# Webhook: HAKI_DISCORD_WEBHOOK in /etc/haki/alerts.env (root-only, never in git).
+# Customer services: /etc/haki/services.conf, one "<ctid> <systemd-unit>" per line.
+#   haki-watch            run checks
+#   haki-watch --status   print every check's state (no Discord)
+#   haki-watch --report   post the daily report now
+#   haki-watch --test     post a test card
+#   haki-watch --notify <level> <title> <text> [name=value ...]   post one card (used by other haki tools)
+#
+# Installed and configured by `haki install watch` — see modules/watch in the haki repo.
+cd /
+set -uo pipefail
+
+[[ -r /etc/haki/alerts.env ]] && source /etc/haki/alerts.env
+STATE=/var/lib/haki-watch
+CHECKS=$STATE/checks
+QUEUE=$STATE/queue
+EVENTS=$STATE/events.log
+REMIND_SECS=$((12 * 3600))
+BOOT_GRACE=300          # after boot, give guests this long before their checks count
+# Settings come from /etc/haki/haki.conf (written by `haki init`); empty means "skip that check".
+HAKI_BRIDGE=vmbr0 HAKI_SITE_URL="" HAKI_EDGE_VM="" HAKI_OLLAMA_VM="" HAKI_OLLAMA_PORT=11434
+HAKI_REPORT_HOUR=9 HAKI_CONFIRM_RUNS=2
+[[ -r /etc/haki/haki.conf ]] && source /etc/haki/haki.conf
+BRIDGE=$HAKI_BRIDGE
+SITE=$HAKI_SITE_URL                    # public site checked from the host (optional)
+SITE_HOST=$(printf '%s' "$SITE" | sed -E 's#^[a-z]+://([^/]+).*#\1#')
+EDGE_VM=$HAKI_EDGE_VM                  # VM running cloudflared / the reverse proxy (optional)
+OLLAMA_VM=$HAKI_OLLAMA_VM              # VM running ollama (optional)
+OLLAMA_PORT=$HAKI_OLLAMA_PORT
+REPORT_HOUR=$HAKI_REPORT_HOUR
+CONFIRM=$HAKI_CONFIRM_RUNS
+ROOT_DISK=$(lsblk -sno NAME,TYPE "$(findmnt -no SOURCE /)" 2>/dev/null | awk '$2 == "disk" { gsub(/[^a-z0-9]/, "", $1); print $1; exit }')
+NODE=$(hostname)
+NOW=$(date +%s)
+UPTIME=$(cut -d. -f1 /proc/uptime)
+mkdir -p "$CHECKS" "$QUEUE"
+export LVM_SUPPRESS_FD_WARNINGS=1 # lvs complains about the lock fd otherwise
+
+log() { echo "haki-watch: $*"; }
+when() { date -d "@$1" '+%d %b %H:%M'; }
+dur() { # seconds -> "3 d 2 h" / "2 h 13 min" / "4 min"
+  local s=$1
+  if (( s >= 86400 )); then echo "$((s / 86400)) d $((s % 86400 / 3600)) h"
+  elif (( s >= 3600 )); then echo "$((s / 3600)) h $((s % 3600 / 60)) min"
+  else echo "$(( (s + 59) / 60 )) min"; fi
+}
+event() { echo "$NOW $1 $2 $3" >> "$EVENTS"; } # event <kind> <id> <text>
+
+# --- Discord ---------------------------------------------------------------------
+# notify <level> <title> <description> [name=value ...]   ("+name" = full-width field)
+notify() {
+  local level=$1 title=$2 desc=$3 color icon; shift 3
+  case $level in
+    down)    color=15158332 icon="🔴" ;;
+    still)   color=15105570 icon="🟠" ;;
+    ok)      color=3066993  icon="🟢" ;;
+    warn)    color=15844367 icon="🟡" ;;
+    online)  color=3447003  icon="🔌" ;;
+    report)  color=9807270  icon="📋" ;;
+    *)       color=3447003  icon="ℹ️" ;;
+  esac
+  log "$level: $title"
+  perl -CA -MJSON -MPOSIX=strftime -e '
+    my ($color, $title, $desc, $node, @f) = @ARGV;
+    my @fields;
+    for (@f) {
+      my ($n, $v) = split /=/, $_, 2;
+      next unless defined $v && length $v;
+      my $inline = $n =~ s/^\+// ? JSON::false : JSON::true;
+      push @fields, { name => $n, value => substr($v, 0, 1000), inline => $inline };
+    }
+    print encode_json({ username => "haki-watch", embeds => [{
+      title => substr($title, 0, 250), description => substr($desc, 0, 4000), color => 0 + $color,
+      fields => \@fields, footer => { text => "haki-watch · $node" },
+      timestamp => strftime("%Y-%m-%dT%H:%M:%SZ", gmtime) }] });
+  ' "$color" "$icon $title" "$desc" "$NODE" "$@" > "$QUEUE/$(date +%s%N).json"
+}
+
+# Send queued cards oldest first; stop at the first failure and keep the rest for next run.
+flush_queue() {
+  [[ -n ${HAKI_DISCORD_WEBHOOK:-} ]] || { log "no webhook configured; cards stay in $QUEUE"; return; }
+  exec 8>"$STATE/queue.lock"; flock -w 60 8 || return # haki-usb-backup sends through here too
+  find "$QUEUE" -name '*.json' -mtime +7 -delete
+  local f age
+  for f in $(find "$QUEUE" -name '*.json' | sort); do
+    age=$(( $(date +%s) - $(stat -c %Y "$f") ))
+    if (( age > 300 )) && ! grep -q 'sent late' "$f"; then
+      perl -MJSON -0777 -i -ne '$d = decode_json($_);
+        $d->{embeds}[0]{footer}{text} .= " · sent late (no internet when it happened)"; print encode_json($d)' "$f"
+    fi
+    if curl -fsS --max-time 10 -H 'Content-Type: application/json' -d @"$f" "$HAKI_DISCORD_WEBHOOK" >/dev/null; then
+      rm -f "$f"; sleep 1
+    else
+      log "Discord unreachable; $(find "$QUEUE" -name '*.json' | wc -l) card(s) queued"; return
+    fi
+  done
+}
+
+# --- check state -----------------------------------------------------------------
+# $CHECKS/<id>: line 1 "<ok|failing|down> <first_fail> <fails> <last_alert>", line 2 the title.
+# report <id> <ok|fail|skip> <title> [detail] [what to do]
+report() {
+  local id=$1 result=$2 title=$3 detail=${4:-} hint=${5:-} file="$CHECKS/$1"
+  local st=ok first=0 fails=0 alerted=0 old_title="" level=${SEV:-down}
+  if [[ -s $file ]]; then { read -r st first fails alerted; read -r old_title; } < "$file"; fi
+  case $result in
+    skip) return ;;
+    fail)
+      (( fails == 0 )) && first=$NOW
+      fails=$((fails + 1))
+      if [[ $st == down ]]; then
+        if (( NOW - alerted >= REMIND_SECS )); then
+          notify still "STILL DOWN · $title" "${detail:-No change.}" \
+            "Down for=$(dur $((NOW - first)))" "Since=$(when "$first")" "+What to do=$hint"
+          alerted=$NOW
+        fi
+      elif (( fails >= CONFIRM )); then
+        notify "$level" "$([[ $level == warn ]] && echo WARNING || echo DOWN) · $title" "${detail:-}" \
+          "Failing since=$(when "$first")" "Checks failed=$fails in a row" "+What to do=$hint"
+        st=down alerted=$NOW old_title=$title
+        event down "$id" "$title"
+      else
+        st=failing old_title=$title
+        log "$id failed once ($detail) — waiting for confirmation"
+      fi
+      printf '%s %s %s %s\n%s\n' "$st" "$first" "$fails" "$alerted" "$title" > "$file" ;;
+    ok)
+      if [[ $st == down ]]; then
+        notify ok "RECOVERED · ${old_title:-$id}" "Back to normal." \
+          "Was down for=$(dur $((NOW - first)))" "From=$(when "$first")" "Until=$(when "$NOW")"
+        event recovered "$id" "${old_title:-$id} (down $(dur $((NOW - first))))"
+      elif [[ $st == failing ]]; then
+        event blip "$id" "${old_title:-$id}"
+      fi
+      printf 'ok 0 0 0\n%s\n' "$title" > "$file" ;;
+  esac
+}
+
+# check <id> <title> <hint> <command...>: run a command, report its result and last output line.
+check() {
+  local id=$1 title=$2 hint=$3 out; shift 3
+  if out=$("$@" 2>&1); then report "$id" ok "$title"
+  else report "$id" fail "$title" "$(printf '%s' "$out" | tail -1 | cut -c1-300)" "$hint"; fi
+}
+
+in_grace() { (( UPTIME < BOOT_GRACE )); }
+
+# --- guests on the LAN, found by MAC ----------------------------------------------
+vm_mac() { qm config "$1" | sed -n 's/^net0: [a-z0-9]*=\([0-9A-Fa-f:]\{17\}\),.*/\1/p' | tr 'A-F' 'a-f'; }
+# neigh_ips <mac>: IPv4 addresses the neighbour table has for this MAC, freshest first.
+neigh_ips() {
+  ip -4 neigh show dev "$BRIDGE" | awk -v m="$1" '$2 == "lladdr" && tolower($3) == m {
+      if ($NF ~ /REACHABLE|DELAY|PROBE|PERMANENT/) print $1; else s = s $1 "\n" } END { printf "%s", s }'
+}
+# owns <ip> <mac>: after a ping/ARP, does this address answer with this MAC right now?
+owns() {
+  ping -c1 -W1 -q "$1" >/dev/null 2>&1
+  ip -4 neigh show "$1" dev "$BRIDGE" | awk -v m="$2" 'tolower($3) == m && $NF !~ /FAILED|INCOMPLETE/ { f = 1 } END { exit !f }'
+}
+
+# guest_ip <vmid>: current IPv4 of the VM, or empty. Remembers the last one; sweeps the /24
+# (at most every 10 min) only when the VM isn't where it was.
+guest_ip() {
+  local id=$1 mac cached ip="" c net
+  mac=$(vm_mac "$id"); [[ -n $mac ]] || return
+  cached=$(cat "$STATE/ip-$id" 2>/dev/null || true)
+  if [[ -n $cached ]] && owns "$cached" "$mac"; then echo "$cached"; return; fi
+  for c in $(neigh_ips "$mac"); do owns "$c" "$mac" && { ip=$c; break; }; done
+  if [[ -z $ip ]] && (( NOW - $(stat -c %Y "$STATE/sweep" 2>/dev/null || echo 0) > 600 )); then
+    touch "$STATE/sweep"
+    net=$(ip -4 -o addr show "$BRIDGE" | awk '{ split($4, a, "."); print a[1] "." a[2] "." a[3]; exit }')
+    for i in $(seq 1 254); do ping -c1 -W1 -q "$net.$i" >/dev/null 2>&1 & done; wait
+    for c in $(neigh_ips "$mac"); do owns "$c" "$mac" && { ip=$c; break; }; done
+  fi
+  [[ -n $ip ]] || return
+  if [[ -n $cached && $cached != "$ip" ]]; then
+    notify info "VM $id moved to a new address" "The router gave VM $id **$ip** (was $cached). Checks follow it automatically." \
+      "+Why=DHCP reservations on the router aren't matching this VM. Things that use the old address (SSH aliases, haki-net, docs) need updating."
+    event ipchange "vm-$id" "$cached -> $ip"
+  fi
+  echo "$ip" > "$STATE/ip-$id"; echo "$ip"
+}
+
+# --- modes -----------------------------------------------------------------------------
+print_status() {
+  local f st first fails alerted title
+  printf '%-22s %-8s %s\n' CHECK STATE DETAIL
+  for f in "$CHECKS"/*; do
+    { read -r st first fails alerted; read -r title; } < "$f"
+    case $st in
+      ok) printf '%-22s %-8s\n' "${f##*/}" ok ;;
+      *)  printf '%-22s %-8s %s (since %s, %s fails)\n' "${f##*/}" "$st" "$title" "$(when "$first")" "$fails" ;;
+    esac
+  done
+  echo; echo "queued cards: $(find "$QUEUE" -name '*.json' | wc -l)"
+  for f in "$STATE"/ip-*; do [[ -e $f ]] && echo "VM ${f##*ip-}: $(cat "$f")"; done
+  echo; echo "last 24 h:"; awk -v t=$((NOW - 86400)) '$1 >= t { $1 = strftime("%d %b %H:%M", $1); print "  " $0 }' "$EVENTS" 2>/dev/null
+}
+
+daily_report() {
+  local guests="" id name st ip down="" f s first _a _b title blips incidents last age_days
+  for id in $(qm list | awk 'NR > 1 { print $1 }'); do
+    name=$(qm config "$id" | awk '/^name:/ { print $2 }'); st=$(qm status "$id" | awk '{ print $2 }')
+    ip=$(cat "$STATE/ip-$id" 2>/dev/null || echo "?")
+    guests+="VM $id $name — $st, $ip"$'\n'
+  done
+  for id in $(pct list | awk 'NR > 1 { print $1 }'); do
+    name=$(pct config "$id" | awk '/^hostname:/ { print $2 }'); st=$(pct status "$id" | awk '{ print $2 }')
+    guests+="CT $id $name — $st"$'\n'
+  done
+  for f in "$CHECKS"/*; do
+    { read -r s first _a _b; read -r title; } < "$f"
+    [[ $s == down ]] && down+="• $title (since $(when "$first"))"$'\n'
+  done
+  blips=$(awk -v t=$((NOW - 86400)) '$1 >= t && $2 == "blip"' "$EVENTS" 2>/dev/null | wc -l)
+  incidents=$(awk -v t=$((NOW - 86400)) '$1 >= t && $2 ~ /^(down|recovered|offline|ipchange)$/ {
+      $1 = strftime("%d %b %H:%M", $1); $3 = ""; print "• " $0 }' "$EVENTS" 2>/dev/null | tail -15)
+  last=$(cat /var/lib/haki-backup/last-success 2>/dev/null || echo 0)
+  age_days=$(( (NOW - last) / 86400 ))
+  local label="all good"
+  [[ -n $down ]] && label="$(printf '%s' "$down" | grep -c .) problem(s)"
+  local recent="${incidents:-No incidents.}"
+  (( blips > 0 )) && recent+=$'\n'"$blips one-off blip(s) ignored (failed once, fine on the next check)"
+  notify report "Daily report · $label" \
+    "${down:-Every check is passing.}" \
+    "Uptime=$(dur "$UPTIME") (since $(when $((NOW - UPTIME))))" \
+    "Load=$(cut -d' ' -f1-3 /proc/loadavg)" \
+    "RAM free=$(awk '/^MemAvailable:/ { printf "%.1f GB", $2 / 1048576 }' /proc/meminfo)" \
+    "Root disk=$(df --output=pcent / | tail -1 | tr -d ' ') used" \
+    "VM storage=$(p=$(lvs --noheadings -o data_percent pve/data 2>/dev/null | tr -d ' '); [[ -n $p ]] && echo "$p% used")" \
+    "Last backup=$( (( last > 0 )) && echo "$(when "$last") ($age_days d ago)" || echo never)" \
+    "+Guests=${guests:-none}" \
+    "+Last 24 h=$recent"
+  date +%F > "$STATE/report-date"
+}
+
+case ${1:-} in
+  --status) print_status; exit 0 ;;
+  --test)   notify info "Test card" "haki-watch can post to this channel."; flush_queue; exit 0 ;;
+  --report) daily_report; flush_queue; exit 0 ;;
+  --notify) shift; notify "$@"; flush_queue; exit 0 ;; # used by haki-usb-backup
+esac
+
+exec 9>/run/lock/haki-watch.lock
+flock -n 9 || { log "previous run still going"; exit 0; }
+
+# --- first run after a boot -------------------------------------------------------------
+boot_id=$(cat /proc/sys/kernel/random/boot_id)
+if [[ $(cat "$STATE/boot-id" 2>/dev/null) != "$boot_id" ]]; then
+  booted=$((NOW - UPTIME))
+  last_seen=$(cat "$STATE/heartbeat" 2>/dev/null || echo 0)
+  if journalctl -b -1 -n 400 --no-pager -q 2>/dev/null \
+       | grep -qE 'Reached target .*(Power-Off|Reboot|System Shutdown|Halt)|systemd-shutdown|Journal stopped'; then
+    cause="Clean shutdown or reboot."
+  else
+    cause="**No clean shutdown was logged — power cut or crash.**"
+  fi
+  if (( last_seen > 0 )); then
+    notify online "Server back online" "haki was offline for **$(dur $((booted - last_seen)))**. $cause" \
+      "Last seen=$(when "$last_seen")" "Booted=$(when "$booted")" \
+      "+Note=Any outage alert from an external monitor in that window was real. Guest checks start after a ${BOOT_GRACE}s grace period."
+    event offline host "offline $(dur $((booted - last_seen))) ($(when "$last_seen") -> $(when "$booted"))"
+  else
+    notify online "haki-watch started" "First run on this server."
+  fi
+  echo "$boot_id" > "$STATE/boot-id"
+fi
+
+# --- internet + public site --------------------------------------------------------------
+if curl -fsS -o /dev/null --max-time 8 https://1.1.1.1/cdn-cgi/trace 2>/dev/null || ping -c2 -W3 -q 8.8.8.8 >/dev/null 2>&1; then
+  report internet ok "Home internet is down"
+  [[ -n $SITE ]] && code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 --retry 2 --retry-delay 5 --retry-all-errors \
+           "$SITE" 2>"$STATE/curl.err")
+  err=$(tail -1 "$STATE/curl.err" 2>/dev/null)
+  [[ -z $SITE ]] && code=none
+  edge="the edge VM${EDGE_VM:+ ($EDGE_VM)}"
+  case $code in
+    none) ;; # no site configured (HAKI_SITE_URL)
+    200) report site-public ok "$SITE_HOST is down" ;;
+    530) report site-public fail "$SITE_HOST is down (Cloudflare 530 / error 1033)" \
+           "Cloudflare can't reach the tunnel: cloudflared on $edge is stopped or the VM has no network." \
+           "Check that VM's network card below. Otherwise on it: sudo systemctl status cloudflared" ;;
+    502|503|504) report site-public fail "$SITE_HOST is down (HTTP $code)" \
+           "The site's proxy answers, but the web server behind it ($edge) isn't answering properly." \
+           "On $edge: sudo systemctl status nginx && sudo nginx -t" ;;
+    000) report site-public fail "$SITE_HOST is not responding" "${err:-No response within 15 s.}" \
+           "Could be Cloudflare or DNS; an external monitor would confirm from outside." ;;
+    *)   report site-public fail "$SITE_HOST returns HTTP $code" "Expected 200 from $SITE." \
+           "Check the last deploy and the web server config." ;;
+  esac
+else
+  # Can't tell anything about the public site without internet; this card is queued until it's back.
+  report internet fail "Home internet is down" "The host can reach neither 1.1.1.1 nor 8.8.8.8. The site is offline for visitors too." \
+    "Check the router / ISP. Alerts raised meanwhile are sent when the connection returns."
+  report site-public skip ""
+fi
+
+# --- VMs ----------------------------------------------------------------------------------
+EDGE_IP=""
+for id in $(qm list | awk 'NR > 1 { print $1 }'); do
+  qm config "$id" | grep -q '^onboot: 1' || continue
+  name=$(qm config "$id" | awk '/^name:/ { print $2 }')
+  if ! qm status "$id" | grep -q running; then
+    report "vm-$id" fail "VM $id ($name) is not running" "$(qm status "$id")" "Proxmox UI → $id → Start, then look at its Tasks log."
+    continue
+  fi
+  report "vm-$id" ok "VM $id ($name) is not running"
+
+  # A "systemctl restart networking" leaves fwpr<id>p0 detached from the bridge while VMs keep running.
+  port=fwpr${id}p0
+  qm config "$id" | grep -q '^net0:.*firewall=1' || port=tap${id}i0
+  master=$(ip -o link show "$port" 2>/dev/null | grep -o 'master [^ ]*' | cut -d' ' -f2)
+  if [[ $master == "$BRIDGE" ]]; then report "vm-$id-port" ok "VM $id ($name) is unplugged from the network"
+  else report "vm-$id-port" fail "VM $id ($name) is unplugged from the network" \
+         "$port is attached to '${master:-nothing}' instead of $BRIDGE." "On the host: ip link set $port master $BRIDGE"; fi
+
+  ip=$(guest_ip "$id")
+  [[ $id == "$EDGE_VM" ]] && EDGE_IP=$ip
+  if [[ -n $ip ]]; then report "vm-$id-lan" ok "VM $id ($name) is not answering on the LAN"
+  elif in_grace; then report "vm-$id-lan" skip ""
+  else report "vm-$id-lan" fail "VM $id ($name) is not answering on the LAN" \
+         "The VM is running but no address on the LAN belongs to its network card." \
+         "Open its console in the Proxmox UI: stuck boot, or its network didn't come up."; fi
+
+  if [[ $id == "$OLLAMA_VM" ]]; then
+    if [[ -z $ip ]]; then report ollama skip ""
+    elif in_grace && ! curl -fsS --max-time 10 "http://$ip:$OLLAMA_PORT/api/version" >/dev/null 2>&1; then report ollama skip ""
+    else check ollama "ollama API on VM $id is not responding" "On VM $id: systemctl status ollama" \
+           curl -fsS --max-time 10 "http://$ip:$OLLAMA_PORT/api/version"; fi
+  fi
+done
+
+# Customer ports are only accepted from the edge VM's address hard-coded in haki-net.
+haki_edge=$(sed -n 's/^EDGE=\([0-9.]*\).*/\1/p' /usr/local/sbin/haki-net 2>/dev/null)
+if [[ -n $EDGE_IP && -n $haki_edge ]]; then
+  if [[ $EDGE_IP == "$haki_edge" ]]; then report haki-net-edge ok "haki-net points at the wrong edge address"
+  else SEV=warn report haki-net-edge fail "haki-net points at the wrong edge address" \
+         "The edge VM is at $EDGE_IP but haki-net only accepts customer traffic from $haki_edge, so published customer sites won't load." \
+         "Make the router keep the edge VM on $haki_edge, or set EDGE= in haki-net and run haki-net apply."; fi
+fi
+
+# --- containers and customer services ------------------------------------------------------
+for id in $(pct list | awk 'NR > 1 { print $1 }'); do
+  pct config "$id" | grep -q '^onboot: 1' || continue
+  name=$(pct config "$id" | awk '/^hostname:/ { print $2 }')
+  check "ct-$id" "Container $id ($name) is not running" "Proxmox UI → $id → Start" \
+    sh -c "pct status $id | grep -q running || { pct status $id; exit 1; }"
+done
+if [[ -r /etc/haki/services.conf ]]; then
+  while read -r ctid unit; do
+    [[ -z $ctid || $ctid == \#* ]] && continue
+    if in_grace && ! pct exec "$ctid" -- systemctl is-active --quiet "$unit" 2>/dev/null; then report "svc-$ctid-$unit" skip ""; continue; fi
+    check "svc-$ctid-$unit" "Service $unit in container $ctid is down" \
+      "pct exec $ctid -- journalctl -u $unit -n 50" \
+      sh -c "pct exec $ctid -- systemctl is-active $unit || { pct exec $ctid -- journalctl -u $unit -n 1 --no-pager -o cat; exit 1; }"
+  done < /etc/haki/services.conf
+fi
+
+# --- host health ---------------------------------------------------------------------------
+disk=$(df --output=pcent / | tail -1 | tr -dc '0-9')
+check host-disk "Host root disk is ${disk}% full" "Clean up /var/log, old ISOs in /var/lib/vz/template/iso, apt clean." test "$disk" -lt 85
+
+if pool=$(lvs --noheadings -o data_percent pve/data 2>/dev/null | tr -d ' ' | cut -d. -f1) && [[ -n $pool ]]; then
+  check host-pool "VM storage pool (local-lvm) is ${pool}% full" "Remove old snapshots or unused disks (Proxmox UI → local-lvm)." test "$pool" -lt 80
+fi
+
+avail_mb=$(awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo)
+check host-mem "Host has only ${avail_mb} MB RAM available" "See which guest grew: top -o RES on the host." test "$avail_mb" -gt 1024
+
+failed=$(systemctl --failed --no-legend --plain | awk '{ print $1 }' | tr '\n' ' ')
+check host-units "Failed services on host: ${failed:-none}" "systemctl status ${failed%% *}; journalctl -u ${failed%% *}" test -z "$failed"
+
+if [[ -n $ROOT_DISK ]] && command -v smartctl >/dev/null; then
+  check host-ssd "Disk /dev/$ROOT_DISK SMART health check failed" "Back up now and plan a replacement." \
+    sh -c "smartctl -H /dev/$ROOT_DISK | grep -q PASSED || smartctl -H /dev/$ROOT_DISK | tail -2"
+fi
+
+# Optional features: only checked when they're installed.
+if [[ -x /usr/local/sbin/haki-net ]]; then
+  check haki-net "Customer network firewall (haki-net) is not loaded" "On the host: haki-net check && haki-net apply" nft list table inet haki
+fi
+if [[ -x /usr/local/sbin/haki-usb-backup ]]; then
+  last=$(cat /var/lib/haki-backup/last-success 2>/dev/null || echo 0)
+  age_days=$(( (NOW - last) / 86400 ))
+  SEV=warn check backup-age "Last USB backup was ${age_days} days ago" "Plug in the backup drive; it backs up and unmounts on its own." test "$age_days" -lt 8
+fi
+
+# --- daily report, heartbeat, send ----------------------------------------------------------
+if (( $(date +%-H) >= REPORT_HOUR )) && [[ $(cat "$STATE/report-date" 2>/dev/null) != "$(date +%F)" ]]; then
+  daily_report
+fi
+[[ -f $EVENTS ]] && awk -v t=$((NOW - 30 * 86400)) '$1 >= t' "$EVENTS" > "$EVENTS.tmp" && mv "$EVENTS.tmp" "$EVENTS"
+echo "$NOW" > "$STATE/heartbeat"
+flush_queue
+exit 0

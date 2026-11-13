@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# haki-nic-watchdog — bring the host's network back if the router stops answering.
+#
+# Some network cards (and some routers) drop the link now and then and don't recover on their own.
+# This waits 2 minutes after boot, pings the router every 30 s, and after 3 misses in a row
+# runs `ifreload -a`, which re-applies /etc/network/interfaces WITHOUT unplugging running VMs.
+#
+# Never use `systemctl restart networking` for this: it rebuilds the bridge and leaves every
+# running VM unplugged from it (they keep running, silently offline) until you re-attach them.
+# Installed by `haki install nic-watchdog`.
+set -uo pipefail
+
+GATEWAY=""
+[[ -r /etc/haki/haki.conf ]] && source /etc/haki/haki.conf && GATEWAY=${HAKI_GATEWAY:-}
+INTERVAL=30 MISSES=3 STARTUP_DELAY=120
+
+sleep "$STARTUP_DELAY"
+fails=0
+while true; do
+  gw=${GATEWAY:-$(ip route show default | awk '{ print $3; exit }')}
+  if [[ -n $gw ]] && ping -c1 -W3 "$gw" >/dev/null 2>&1; then
+    fails=0
+  else
+    fails=$((fails + 1))
+    echo "haki-nic-watchdog: router ${gw:-?} did not answer ($fails/$MISSES)"
+    if (( fails >= MISSES )); then
+      echo "haki-nic-watchdog: running ifreload -a"
+      ifreload -a
+      fails=0
+      sleep 60 # give the link time to come back before counting again
+    fi
+  fi
+  sleep "$INTERVAL"
+done

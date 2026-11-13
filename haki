@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# haki — safe defaults and small building blocks for a home Proxmox server.
+# Run `haki help` for the full guide.
+set -uo pipefail
+
+HAKI_ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+HAKI_VERSION=$(cat "$HAKI_ROOT/VERSION" 2>/dev/null || echo dev)
+# shellcheck source=lib/common.sh
+source "$HAKI_ROOT/lib/common.sh"
+
+# --- modules ----------------------------------------------------------------------------------
+module_names() { for d in "$HAKI_ROOT"/modules/*/; do [[ -f $d/module.sh ]] && basename "$d"; done; }
+
+# load_module <name>: source a module into this shell (each module defines the same function names).
+load_module() {
+  local name=$1 file="$HAKI_ROOT/modules/$1/module.sh"
+  [[ -f $file ]] || die "no module called '$name'. See: haki list"
+  unset -f module_check module_install module_uninstall module_status module_help module_commands
+  unset MODULE_SUMMARY MODULE_REQUIRES MODULE_ABOUT MODULE_CHANGES MODULE_COMMANDS
+  MODULE_DIR="$HAKI_ROOT/modules/$name" MODULE_NAME=$name
+  # shellcheck disable=SC1090
+  source "$file"
+}
+
+print_module_info() {
+  load_module "$1"
+  title "$MODULE_NAME — $MODULE_SUMMARY"
+  printf '%s\n' "$MODULE_ABOUT" | sed 's/^/  /'
+  echo; echo "  ${C_B}What it changes on your host${C_0}"
+  printf '%s\n' "$MODULE_CHANGES" | sed 's/^/    /'
+  [[ -n ${MODULE_REQUIRES:-} ]] && { echo; echo "  ${C_B}Needs${C_0}: $MODULE_REQUIRES"; }
+  if [[ -n ${MODULE_COMMANDS:-} ]]; then
+    echo; echo "  ${C_B}Commands${C_0}"; printf '%s\n' "$MODULE_COMMANDS" | sed 's/^/    /'
+  fi
+  echo; echo "  ${C_B}Try it${C_0}"
+  echo "    haki plan $MODULE_NAME        # list every change, apply nothing"
+  echo "    haki install $MODULE_NAME     # apply (asks before changing anything)"
+  echo "    haki status $MODULE_NAME      # check it is working"
+}
+
+# --- commands ---------------------------------------------------------------------------------
+cmd_help() {
+  if [[ -n ${1:-} ]]; then
+    if [[ -d $HAKI_ROOT/modules/$1 ]]; then print_module_info "$1"; return; fi
+    case $1 in
+      init|list|info|plan|install|uninstall|status|doctor|update|version) ;;
+      *) die "no command or module called '$1'. Try: haki help" ;;
+    esac
+  fi
+  cat <<EOF
+${C_B}haki $HAKI_VERSION${C_0} — safe defaults and small building blocks for a home Proxmox server.
+
+${C_B}Getting started (about 5 minutes)${C_0}
+  haki doctor                 Check this host: Proxmox version, network, disks, what's installed.
+  haki init                   Detect your network and write /etc/haki/haki.conf (asks before saving).
+  haki plan hardening watch   Show every change these modules would make. Changes nothing.
+  haki install hardening watch
+                              Apply them. You see the plan and confirm first.
+
+${C_B}Everyday commands${C_0}
+  haki list                   All modules, one line each, and whether they're installed.
+  haki info <module>          What a module does, why, what it changes, and its commands.
+  haki plan <module>...       Dry run: the exact files and services that would change.
+  haki install <module>...    Install or update modules. Safe to re-run.
+  haki uninstall <module>     Remove what a module installed (backups are kept).
+  haki status [module]        Health of installed modules, with a hint when something is off.
+  haki <module> <command>     Module commands, e.g. "haki watch test", "haki backup-usb run".
+  haki update                 Pull the latest haki and re-apply installed modules.
+
+${C_B}Options${C_0}
+  -y, --yes                   Answer "yes" to confirmations and take default answers.
+                              Safety checks (like the SSH key check) still apply.
+
+${C_B}Good to know${C_0}
+  • Everything haki replaces is first copied to /var/lib/haki/backups/<time>/.
+  • Config lives in /etc/haki/haki.conf; secrets (Discord webhook) in /etc/haki/alerts.env (0600).
+  • Nothing is exposed to the internet by any module. Proxmox's web UI stays LAN-only.
+
+Run ${C_B}haki list${C_0} to see the modules, or ${C_B}haki info <module>${C_0} for details.
+EOF
+}
+
+cmd_list() {
+  title "Modules"
+  local m state
+  for m in $(module_names); do
+    load_module "$m"
+    if module_installed "$m"; then state="${C_GRN}installed${C_0}"; else state="${C_DIM}available${C_0}"; fi
+    printf '  %-14s %-22s %s\n' "$m" "$state" "$MODULE_SUMMARY"
+  done
+  echo
+  note "Details: haki info <module>     Coming next: customer-net, tenant, edge, ollama-gpu, notes-sync"
+}
+
+cmd_info() { [[ -n ${1:-} ]] || die "usage: haki info <module>"; print_module_info "$1"; }
+
+# plan/install share one code path; plan just sets HAKI_PLAN=1.
+apply_modules() {
+  local mode=$1; shift
+  [[ $# -gt 0 ]] || die "usage: haki $mode <module>...  (see: haki list)"
+  need_root; need_pve; load_config
+  [[ -r $HAKI_CONF ]] || warn "no $HAKI_CONF yet — run 'haki init' first; using detected defaults for now."
+
+  local m failed=0
+  for m in "$@"; do
+    load_module "$m"
+    title "$m — $MODULE_SUMMARY"
+    if declare -F module_check >/dev/null && ! module_check; then
+      bad "not ready to install $m (see above)"; failed=1; continue
+    fi
+    if [[ $mode == install ]]; then
+      echo "  Planned changes:"
+      HAKI_PLAN=1 module_install
+      echo
+      if ! confirm "Apply these changes for $m?"; then skip "skipped $m"; continue; fi
+      echo
+      if module_install; then mark_installed "$m"; ok "$m installed"; else bad "$m did not finish"; failed=1; fi
+    else
+      HAKI_PLAN=1 module_install
+      note "(plan only — nothing was changed. Apply with: haki install $m)"
+    fi
+  done
+  return $failed
+}
+
+cmd_uninstall() {
+  [[ -n ${1:-} ]] || die "usage: haki uninstall <module>"
+  need_root; load_config; load_module "$1"
+  module_installed "$1" || warn "$1 isn't marked as installed; removing whatever is there anyway."
+  title "Uninstall $1"
+  HAKI_PLAN=1 module_uninstall; echo
+  confirm "Remove these?" || { skip "nothing changed"; return 0; }
+  module_uninstall && mark_removed "$1" && ok "$1 removed (backups in $HAKI_STATE/backups)"
+}
+
+cmd_status() {
+  need_root; load_config
+  local mods=("$@") m rc=0
+  if [[ ${#mods[@]} -eq 0 ]]; then
+    for m in $(module_names); do module_installed "$m" && mods+=("$m"); done
+    [[ ${#mods[@]} -gt 0 ]] || { echo "No modules installed yet. Start with: haki help"; return 0; }
+  fi
+  for m in "${mods[@]}"; do
+    load_module "$m"; title "$m"
+    module_status || rc=1
+  done
+  return $rc
+}
+
+cmd_doctor() {
+  need_root; load_config
+  title "Host"
+  if command -v pveversion >/dev/null; then ok "$(pveversion)"; else bad "not a Proxmox VE host"; fi
+  ok "kernel $(uname -r), $(nproc) CPUs, $(awk '/MemTotal/ { printf "%.1f GB", $2 / 1048576 }' /proc/meminfo) RAM"
+  local br; br=$(default_bridge)
+  ok "default route via $(default_gateway) on ${br:-?} (host IP $(bridge_ip "${br:-vmbr0}"))"
+  ok "root disk: /dev/$(root_disk) ($(df -h --output=pcent / | tail -1 | tr -d ' ') used)"
+  if [[ -s /root/.ssh/authorized_keys ]]; then ok "root has an SSH key ($(grep -cE '^(ssh|ecdsa|sk-)' /root/.ssh/authorized_keys) key(s))"
+  else warn "root has no SSH key — 'hardening' will not switch SSH to key-only until it does"; fi
+  if curl -fsS -o /dev/null --max-time 6 https://1.1.1.1/cdn-cgi/trace; then ok "internet reachable"; else warn "no internet from the host"; fi
+  title "haki"
+  ok "haki $HAKI_VERSION at $HAKI_ROOT"
+  if [[ -r $HAKI_CONF ]]; then ok "config: $HAKI_CONF"; else warn "no config yet — run: haki init"; fi
+  local m; for m in $(module_names); do
+    if module_installed "$m"; then ok "module $m installed"; else skip "module $m not installed"; fi
+  done
+}
+
+cmd_init() {
+  need_root; need_pve; load_config
+  title "haki init — describe this host"
+  echo "  haki detects what it can. Press Enter to accept each value in [brackets]."
+  echo
+  local br gw ip
+  br=$(default_bridge); gw=$(default_gateway); ip=$(bridge_ip "${br:-vmbr0}")
+  ask "LAN bridge (the one your router is on):" "${br:-$HAKI_BRIDGE}"; local v_br=$REPLY
+  ask "Host IP on that bridge:" "${ip:-$HAKI_HOST_IP}"; local v_ip=$REPLY
+  ask "Router / gateway IP:" "${gw:-$HAKI_GATEWAY}"; local v_gw=$REPLY
+  echo
+  echo "  Optional: a public website on this server that 'watch' should check from the host."
+  echo "  Leave empty if you don't host one yet."
+  ask "Website URL to check (e.g. https://example.com/):" "$HAKI_SITE_URL"; local v_site=$REPLY
+  echo
+  echo "  Settings to save in $HAKI_CONF:"
+  printf '    HAKI_BRIDGE="%s"\n    HAKI_HOST_IP="%s"\n    HAKI_GATEWAY="%s"\n    HAKI_SITE_URL="%s"\n' "$v_br" "$v_ip" "$v_gw" "$v_site"
+  echo
+  confirm "Save?" || { skip "nothing saved"; return 0; }
+  if [[ ! -e $HAKI_CONF ]]; then
+    mkdir -p "$HAKI_ETC"
+    cat > "$HAKI_CONF" <<'EOF'
+# haki configuration. Edit freely; run `haki install <module>` again after changes.
+# Every setting and its default is documented in docs/config.md.
+EOF
+  fi
+  conf_set HAKI_BRIDGE "$v_br"; conf_set HAKI_HOST_IP "$v_ip"
+  conf_set HAKI_GATEWAY "$v_gw"; conf_set HAKI_SITE_URL "$v_site"
+  ok "saved $HAKI_CONF"
+  if [[ ! -e /usr/local/sbin/haki ]] && confirm "Add 'haki' to the PATH (link /usr/local/sbin/haki → $HAKI_ROOT/haki)?"; then
+    ln -s "$HAKI_ROOT/haki" /usr/local/sbin/haki && ok "you can now run 'haki' from anywhere"
+  fi
+  echo
+  echo "  Next: ${C_B}haki plan hardening watch${C_0}  then  ${C_B}haki install hardening watch${C_0}"
+}
+
+cmd_update() {
+  need_root
+  [[ -d $HAKI_ROOT/.git ]] || die "$HAKI_ROOT is not a git checkout; download the new version manually."
+  step "Pulling the latest haki"
+  git -C "$HAKI_ROOT" pull --ff-only || die "git pull failed (local changes?). Nothing was re-applied."
+  local mods=() m
+  for m in $(module_names); do module_installed "$m" && mods+=("$m"); done
+  [[ ${#mods[@]} -gt 0 ]] || { ok "up to date; no modules installed"; return 0; }
+  step "Re-applying installed modules: ${mods[*]}"
+  apply_modules install "${mods[@]}"
+}
+
+# --- main -------------------------------------------------------------------------------------
+args=()
+for a in "$@"; do
+  case $a in
+    -y|--yes) HAKI_YES=1 ;;
+    -h|--help) args+=(help) ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- "${args[@]+"${args[@]}"}"
+
+cmd=${1:-help}; shift || true
+case $cmd in
+  help)      cmd_help "$@" ;;
+  version)   echo "haki $HAKI_VERSION" ;;
+  list)      cmd_list ;;
+  info)      cmd_info "$@" ;;
+  init)      cmd_init ;;
+  doctor)    cmd_doctor ;;
+  plan)      apply_modules plan "$@" ;;
+  install)   apply_modules install "$@" ;;
+  uninstall) cmd_uninstall "$@" ;;
+  status)    cmd_status "$@" ;;
+  update)    cmd_update ;;
+  *)
+    # haki <module> <command> ...
+    [[ -d $HAKI_ROOT/modules/$cmd ]] || die "unknown command '$cmd'. See: haki help"
+    need_root; load_config; load_module "$cmd"
+    sub=${1:-}; shift || true
+    if [[ -z $sub ]] || ! declare -F "module_cmd_$sub" >/dev/null; then
+      print_module_info "$cmd"; [[ -z $sub ]] || exit 1; exit 0
+    fi
+    "module_cmd_$sub" "$@" ;;
+esac
