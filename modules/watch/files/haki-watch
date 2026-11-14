@@ -75,7 +75,7 @@ notify() {
     *)       color=3447003  icon="ℹ️" ;;
   esac
   log "$level: $title"
-  perl -CA -MJSON -MPOSIX=strftime -e '
+  perl -CA -Mutf8 -MJSON -MPOSIX=strftime -e '
     my ($color, $title, $desc, $node, @f) = @ARGV;
     my @fields;
     for (@f) {
@@ -100,7 +100,7 @@ flush_queue() {
   for f in $(find "$QUEUE" -name '*.json' | sort); do
     age=$(( $(date +%s) - $(stat -c %Y "$f") ))
     if (( age > 300 )) && ! grep -q 'sent late' "$f"; then
-      perl -MJSON -0777 -i -ne '$d = decode_json($_);
+      perl -Mutf8 -MJSON -0777 -i -ne '$d = decode_json($_);
         $d->{embeds}[0]{footer}{text} .= " · sent late (no internet when it happened)"; print encode_json($d)' "$f"
     fi
     if curl -fsS --max-time 10 -H 'Content-Type: application/json' -d @"$f" "$HAKI_DISCORD_WEBHOOK" >/dev/null; then
@@ -351,9 +351,13 @@ haki_edge=${HAKI_EDGE_IP:-}
 [[ -n $haki_edge ]] || haki_edge=$(sed -n 's/^EDGE=\([0-9.]*\).*/\1/p' /usr/local/sbin/haki-net 2>/dev/null)
 if [[ -n $EDGE_IP && -n $haki_edge ]]; then
   if [[ $EDGE_IP == "$haki_edge" ]]; then report haki-net-edge ok "haki-net points at the wrong edge address"
-  else SEV=warn report haki-net-edge fail "haki-net points at the wrong edge address" \
-         "The edge VM is at $EDGE_IP but haki-net only accepts customer traffic from $haki_edge, so published customer sites won't load." \
-         "On the host: haki customer-net edge $EDGE_IP  (and give the edge VM a fixed address on the router)."; fi
+  else
+    if grep -qsvE '^\s*(#|$)' /etc/haki/ingress.conf; then impact="Published customer sites won't load."
+    else impact="No customer port is published yet, so nothing is affected right now."; fi
+    SEV=warn report haki-net-edge fail "haki-net points at the wrong edge address" \
+         "The edge VM is at $EDGE_IP but haki-net only accepts customer traffic from $haki_edge. $impact" \
+         "On the host: haki customer-net edge $EDGE_IP  (and give the edge VM a fixed address on the router)."
+  fi
 fi
 
 # --- containers and customer services ------------------------------------------------------
