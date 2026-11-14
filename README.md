@@ -40,8 +40,15 @@ when something is wrong — and why.
 | [`tenant`](modules/tenant/module.sh) | `haki tenant new 202 priya-shop small` → an isolated container with its own IP and CPU/RAM/disk limits, starting on boot. Plus `list`, `publish`, `shell` and `remove`. |
 | [`edge`](modules/edge/module.sh) | Public https addresses with **no port forwarding**, behind CGNAT too: a tiny container runs a Cloudflare Tunnel. `haki edge add shop.example.com 202` publishes a tenant, DNS record included. |
 
-See [docs/hosting.md](docs/hosting.md). Coming next: an ollama API with GPU passthrough
-(`ollama-gpu`), and Obsidian sync over Tailscale (`notes-sync`).
+See [docs/hosting.md](docs/hosting.md).
+
+**Local AI** — open models on an old graphics card, for yourself or your apps:
+
+| Module | What it does |
+|---|---|
+| [`ollama-gpu`](modules/ollama-gpu/module.sh) | Passes your NVIDIA card to a VM that installs its own driver and [ollama](https://ollama.com) on first boot. The API only answers the addresses you allow. Already have one? It's adopted as is. `haki ollama-gpu pull`, `models`, `bench` (tokens/s, how much fits on the GPU). See [docs/ollama.md](docs/ollama.md). |
+
+Coming next: Obsidian sync over Tailscale (`notes-sync`).
 
 ## How it works
 
@@ -85,8 +92,9 @@ Add `--yes` to accept defaults without questions (safety checks still apply).
 ## Is it safe?
 
 I run every module here on my own server, and it's written to be careful: it plans first, backs
-up what it replaces, won't turn off SSH passwords until you've proven your key works, and never
-touches your network config or firewall in these modules. But it runs as root on your hypervisor,
+up what it replaces, won't turn off SSH passwords until you've proven your key works, and leaves
+your existing network alone: only `customer-net` adds a bridge and a firewall of its own, and
+`ollama-gpu` asks for a reboot before a graphics card changes hands. But it runs as root on your hypervisor,
 so read `haki plan` before you `haki install`, and keep a way to reach the console (the Proxmox
 web UI, or a screen and keyboard). See [docs/safety.md](docs/safety.md).
 
@@ -96,6 +104,7 @@ web UI, or a screen and keyboard). See [docs/safety.md](docs/safety.md).
 - [Configuration](docs/config.md) — every setting in `/etc/haki/haki.conf`
 - [Safety](docs/safety.md) — what haki will and won't do, and how to undo it
 - [Hosting other people's apps](docs/hosting.md) — customer-net, tenant and edge, step by step
+- [Local AI on your GPU](docs/ollama.md) — ollama-gpu: passthrough, models, benchmarks
 - [Writing a module](docs/writing-modules.md) — add your own building block
 
 ## License

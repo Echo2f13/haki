@@ -1,0 +1,37 @@
+#cloud-config
+# haki ollama-gpu: first boot of the ollama VM. Made by haki on the Proxmox host from
+# modules/ollama-gpu/files/user-data.yaml; @NAME@-style values are filled in from haki.conf.
+hostname: @HOSTNAME@
+users:
+  - name: haki
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+    ssh_authorized_keys:
+@SSH_KEYS@
+ssh_pwauth: false
+package_update: true
+package_upgrade: true
+packages: [qemu-guest-agent, ufw, curl, pciutils, ubuntu-drivers-common]
+write_files:
+  - path: /etc/systemd/system/ollama.service.d/haki.conf
+    content: |
+      # haki: listen on the network; who may connect is decided by ufw (haki ollama-gpu allow).
+      [Service]
+      Environment=OLLAMA_HOST=0.0.0.0:@PORT@
+runcmd:
+  - systemctl enable --now qemu-guest-agent
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow from @LAN@ to any port 22 proto tcp comment 'haki: ssh from the LAN'
+@UFW_ALLOW@
+  - ufw --force enable
+  # Driver before ollama, so ollama's installer finds it and doesn't fetch its own.
+  - '[ "@GPU@" = none ] || ubuntu-drivers install'
+  - curl -fsSL https://ollama.com/install.sh | sh
+  - touch /var/lib/haki-ollama-ready
+power_state:
+  mode: reboot
+  message: haki - rebooting to load the GPU driver
+  condition: true

@@ -23,6 +23,10 @@ take effect on their next run.
 | `HAKI_EDGE_VM` | empty | VM id of your reverse proxy / tunnel VM, so site alerts name it. |
 | `HAKI_OLLAMA_VM` | empty | VM id running ollama; its API is checked (found by MAC, so DHCP is fine). |
 | `HAKI_OLLAMA_PORT` | `11434` | ollama's port. |
+| `HAKI_OLLAMA_GPU` | auto (first NVIDIA card) | Its PCI slot, e.g. `0000:01:00`; `none` for a CPU-only VM. Module `ollama-gpu`. |
+| `HAKI_OLLAMA_ALLOW` | asked (the host) | Addresses/ranges allowed to use the API in VMs `ollama-gpu` creates. The host is always allowed. Change with `haki ollama-gpu allow` / `deny`. |
+| `HAKI_OLLAMA_ADDR` | empty (DHCP) | A fixed address for the VM `ollama-gpu` creates. |
+| `HAKI_OLLAMA_RAM` / `_CORES` / `_DISK` | `4096` / `4` / `80` | Size of the VM `ollama-gpu` creates (MB / cores / GB). A 7B model needs about 5 GB between VRAM and RAM. |
 | `HAKI_REPORT_HOUR` | `9` | Daily report is sent on the first check after this hour. |
 | `HAKI_CONFIRM_RUNS` | `2` | Failed checks in a row before a DOWN alert (checks are 2 min apart). |
 
