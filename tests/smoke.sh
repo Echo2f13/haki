@@ -62,7 +62,8 @@ user_data_ok() {
   python3 "$ROOT/tests/check-user-data.py" "$TMP/ud.yaml"
 }
 cpu_only_skips_driver() { out=$(render none 192.168.1.240); has '[ "none" = none ] || ubuntu-drivers install'; }
-t "renders valid cloud-init, every placeholder filled" user_data_ok
+if python3 -c 'import yaml' 2>/dev/null; then t "renders valid cloud-init, every placeholder filled" user_data_ok
+else echo "  skip  cloud-init YAML check (needs python3 with PyYAML)"; fi
 t "a CPU-only VM skips the driver" cpu_only_skips_driver
 
 # --- customer-net: the firewall ----------------------------------------------------------------

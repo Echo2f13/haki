@@ -107,6 +107,12 @@ web UI, or a screen and keyboard). See [docs/safety.md](docs/safety.md).
 - [Local AI on your GPU](docs/ollama.md) — ollama-gpu: passthrough, models, benchmarks
 - [Writing a module](docs/writing-modules.md) — add your own building block
 
+## Security
+
+Found a way haki could expose a host, a tenant or a secret? Please report it privately through
+[GitHub's security advisories](https://github.com/Echo2f13/haki/security/advisories/new) rather
+than an issue. What's new in each version is in [CHANGELOG.md](CHANGELOG.md).
+
 ## License
 
 [MIT](LICENSE). Use it for anything. If it saves you a lost weekend, that's thanks enough —

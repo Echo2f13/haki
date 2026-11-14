@@ -12,7 +12,7 @@ modules/my-thing/
 ## module.sh
 
 ```bash
-# shellcheck shell=bash
+# shellcheck shell=bash disable=SC2034   # MODULE_* are read by the haki command
 MODULE_SUMMARY="One line for 'haki list'"
 MODULE_ABOUT="A few paragraphs for 'haki info': what it does, why you'd want it,
 and when you shouldn't install it."
@@ -67,3 +67,15 @@ module_cmd_hello() {    # optional: becomes `haki my-thing hello`
 Helpers available (from `lib/common.sh`): `step ok skip warn bad note plan die`, `ask` / `confirm`,
 `planning`, `install_file`, `write_file`, `remove_file`, `run`, `backup_file`, `conf_set`,
 `default_bridge`, `default_gateway`, `bridge_ip`, `root_disk`, and all `HAKI_*` settings.
+
+## Test it
+
+```bash
+bash tests/smoke.sh            # anywhere, no Proxmox needed: every module loads and explains itself
+haki plan my-thing             # on a Proxmox host: the exact changes, nothing applied
+```
+
+Every push runs ShellCheck and the smoke tests on GitHub (`.github/workflows/lint.yml`); as root
+on the throwaway runner they also check the customer firewall as real nftables. If your module
+renders a config file, add a check for it to `tests/smoke.sh` — see the cloud-init one for
+`ollama-gpu`. Never test `install` on a server you depend on without reading the plan first.
