@@ -71,7 +71,7 @@ if [[ $EUID -eq 0 && ${CI:-} == true ]] && ! command -v pveversion >/dev/null &&
   mkdir -p /etc/haki
   printf 'HAKI_BRIDGE="vmbr0"\nHAKI_HOST_IP="192.168.1.240"\nHAKI_EDGE_IP="192.168.1.241"\n' > /etc/haki/haki.conf
   printf '20202 10.10.0.102 80\n20203 10.10.0.103 8080\n' > "$TMP/ingress"
-  net() { modules/customer-net/files/haki-net "$@"; }
+  net() { bash modules/customer-net/files/haki-net "$@"; }
   only_edge() {
     out=$(net show "$TMP/ingress")
     has 'iifname "vmbr0" ip saddr 192.168.1.241 ip daddr 192.168.1.240 dnat' && has '20202 : 10.10.0.102 . 80' \
@@ -80,6 +80,7 @@ if [[ $EUID -eq 0 && ${CI:-} == true ]] && ! command -v pveversion >/dev/null &&
   no_edge_publishes_nothing() {
     printf 'HAKI_BRIDGE="vmbr0"\nHAKI_HOST_IP="192.168.1.240"\n' > /etc/haki/haki.conf
     out=$(net show "$TMP/ingress")
+    has "table inet haki" || return 1
     if grep -q dnat <<<"$out"; then echo "published ports must be unreachable without an edge"; return 1; fi
   }
   t "rules are valid nftables (ports published)" net check "$TMP/ingress"
