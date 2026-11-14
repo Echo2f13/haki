@@ -1,6 +1,6 @@
 #cloud-config
 # haki ollama-gpu: first boot of the ollama VM. Made by haki on the Proxmox host from
-# modules/ollama-gpu/files/user-data.yaml; @NAME@-style values are filled in from haki.conf.
+# modules/ollama-gpu/files/user-data.yaml; the at-sign placeholders are filled in from haki.conf.
 hostname: @HOSTNAME@
 users:
   - name: haki

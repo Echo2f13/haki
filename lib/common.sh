@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=bash disable=SC2034
 # Shared helpers for the haki command and its modules. Sourced, never run directly.
 #
 # Every change a module makes goes through install_file / write_file / remove_file / run.

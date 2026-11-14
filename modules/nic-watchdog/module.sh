@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=bash disable=SC2034
 # nic-watchdog — recover the host's network if the router stops answering, without unplugging VMs.
 
 MODULE_SUMMARY="Recover the host's network when the router stops answering"

@@ -19,6 +19,7 @@ load_module() {
   [[ -f $file ]] || die "no module called '$name'. See: haki list"
   unset -f module_check module_install module_uninstall module_status module_help module_commands
   unset MODULE_SUMMARY MODULE_REQUIRES MODULE_ABOUT MODULE_CHANGES MODULE_COMMANDS
+  # shellcheck disable=SC2034  # MODULE_DIR is used by the module being loaded
   MODULE_DIR="$HAKI_ROOT/modules/$name" MODULE_NAME=$name
   # shellcheck disable=SC1090
   source "$file"

@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=bash disable=SC2034
 # customer-net — an isolated network for hosting other people's apps on your server.
 
 MODULE_SUMMARY="An isolated network for hosting other people's apps"

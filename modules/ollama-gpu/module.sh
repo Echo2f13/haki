@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=bash disable=SC2034
 # ollama-gpu — a local AI model server on your NVIDIA card, through GPU passthrough to a VM.
 
 MODULE_SUMMARY="Local AI models (ollama) on your NVIDIA GPU, in a VM"
@@ -46,7 +46,7 @@ gpu_slot() {
   if [[ -n $HAKI_OLLAMA_GPU ]]; then echo "$HAKI_OLLAMA_GPU"; return; fi
   lspci -Dn 2>/dev/null | awk '$2 ~ /^03(00|02):$/ && $3 ~ /^10de:/ { print substr($1, 1, length($1) - 2); exit }'
 }
-gpu_funcs()  { local s; s=$(gpu_slot); ls /sys/bus/pci/devices/ | grep "^$s\.[0-7]$"; }
+gpu_funcs()  { local s f; s=$(gpu_slot); for f in /sys/bus/pci/devices/"$s".[0-7]; do [[ -e $f ]] && echo "${f##*/}"; done; }
 gpu_ids()    { local f; for f in $(gpu_funcs); do printf '%s:%s\n' "$(sed 's/^0x//' "/sys/bus/pci/devices/$f/vendor")" "$(sed 's/^0x//' "/sys/bus/pci/devices/$f/device")"; done | paste -sd,; }
 gpu_name()   { lspci -s "$(gpu_slot).0" 2>/dev/null | sed 's/^[^ ]* [^:]*: //'; }
 func_driver(){ basename "$(readlink "/sys/bus/pci/devices/$1/driver" 2>/dev/null)" 2>/dev/null; }
@@ -54,7 +54,8 @@ gpu_on_vfio(){ local f; for f in $(gpu_funcs); do [[ $(func_driver "$f") == vfio
 # Devices sharing the card's IOMMU group, other than the card itself and PCI bridges.
 group_others() {
   local d s; s=$(gpu_slot)
-  for d in $(ls "/sys/bus/pci/devices/$s.0/iommu_group/devices/" 2>/dev/null); do
+  for d in "/sys/bus/pci/devices/$s.0/iommu_group/devices/"*; do
+    [[ -e $d ]] || continue; d=${d##*/}
     [[ $d == "$s".* ]] && continue
     [[ $(cat "/sys/bus/pci/devices/$d/class") == 0x0604* ]] && continue
     echo "$d"
@@ -98,6 +99,18 @@ need_api() {
   need_root; vm_exists || die "no ollama VM (HAKI_OLLAMA_VM). Set it up: haki install ollama-gpu"
   vm_running || die "VM $HAKI_OLLAMA_VM isn't running: qm start $HAKI_OLLAMA_VM"
   api_get /api/version >/dev/null || die "ollama doesn't answer on $(vm_ip):$HAKI_OLLAMA_PORT (first boot can take 10 minutes: haki status ollama-gpu)"
+}
+
+# render_user_data <gpu slot|none> <allowed addresses> <authorized_keys file>: the VM's cloud-init.
+render_user_data() {
+  local gpu=$1 allow=$2 keys ufw='' a
+  keys=$(grep -E '^(ssh|ecdsa|sk-)' "$3" | sed 's/^/      - /')
+  [[ -n $keys ]] || die "no SSH public keys in $3"
+  for a in $allow; do ufw+="  - ufw allow from $a to any port $HAKI_OLLAMA_PORT proto tcp comment 'haki: ollama API'"$'\n'; done
+  KEYS=$keys UFW=${ufw%$'\n'} PORT=$HAKI_OLLAMA_PORT LAN=$(lan_cidr) GPU=$gpu perl -pe '
+      s/\@HOSTNAME\@/ollama/g; s/\@PORT\@/$ENV{PORT}/g; s/\@LAN\@/$ENV{LAN}/g; s/\@GPU\@/$ENV{GPU}/g;
+      $_ = "$ENV{KEYS}\n" if /^\@SSH_KEYS\@$/; $_ = "$ENV{UFW}\n" if /^\@UFW_ALLOW\@$/;' \
+    "$HAKI_ROOT/modules/ollama-gpu/files/user-data.yaml"
 }
 
 # --- module -----------------------------------------------------------------------------------
@@ -176,7 +189,7 @@ EOF
 }
 
 create_vm() {
-  local s=$1 id addr allow storage keys
+  local s=$1 id addr allow storage
   if planning; then id=${HAKI_OLLAMA_VM:-$(pvesh get /cluster/nextid)}
   else ask "VM id" "$(pvesh get /cluster/nextid)"; id=$REPLY; fi
   [[ $id =~ ^[0-9]+$ ]] || die "'$id' is not a VM id"
@@ -225,13 +238,7 @@ create_vm() {
   local content; content=$(pvesh get "/storage/$HAKI_SNIPPET_STORAGE" --output-format json | perl -MJSON -0e 'print decode_json(<STDIN>)->{content}')
   [[ ,$content, == *,snippets,* ]] || run "allow snippets on storage '$HAKI_SNIPPET_STORAGE'" pvesm set "$HAKI_SNIPPET_STORAGE" --content "$content,snippets"
   mkdir -p "$(dirname "$snip")"
-  keys=$(grep -E '^(ssh|ecdsa|sk-)' /root/.ssh/authorized_keys | sed 's/^/      - /')
-  local ufw='' a
-  for a in $allow; do ufw+="  - ufw allow from $a to any port $HAKI_OLLAMA_PORT proto tcp comment 'haki: ollama API'"$'\n'; done
-  KEYS=$keys UFW=${ufw%$'\n'} perl -pe '
-      s/\@HOSTNAME\@/ollama/g; s/\@PORT\@/'"$HAKI_OLLAMA_PORT"'/g; s/\@LAN\@/'"$(lan_cidr | sed 's#/#\\/#')"'/g; s/\@GPU\@/'"$s"'/g;
-      $_ = "$ENV{KEYS}\n" if /^\@SSH_KEYS\@$/; $_ = "$ENV{UFW}\n" if /^\@UFW_ALLOW\@$/;' \
-    "$HAKI_ROOT/modules/ollama-gpu/files/user-data.yaml" | write_file "$snip" 0600
+  render_user_data "$s" "$allow" /root/.ssh/authorized_keys | write_file "$snip" 0600
 
   step "Create VM $id"
   local gpu=() net=ip=dhcp

@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=bash disable=SC2034
 # edge — publish websites through a Cloudflare Tunnel from a small container, with no port forwarding.
 
 MODULE_SUMMARY="Public websites through Cloudflare Tunnel, no port forwarding"
@@ -223,7 +223,7 @@ module_status() {
   if ! edge_running; then bad "CT $HAKI_EDGE_CT ($EDGE_NAME) is stopped. Fix: pct start $HAKI_EDGE_CT"; return 1; fi
   ok "CT $HAKI_EDGE_CT ($EDGE_NAME) running at $HAKI_EDGE_ADDR"
   if ! logged_in; then warn "not connected to Cloudflare yet. Next: haki edge login"; return 0; fi
-  local i; for i in 1 2 3 4 5; do   # just after a restart cloudflared needs a few seconds to connect
+  local _; for _ in 1 2 3 4 5; do   # just after a restart cloudflared needs a few seconds to connect
     n=$(tunnel_connections); [[ ${n:-0} -gt 0 ]] && break; sleep 2
   done
   if [[ ${n:-0} -gt 0 ]]; then ok "tunnel connected ($n connections to Cloudflare)"

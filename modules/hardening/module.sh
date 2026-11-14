@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=bash disable=SC2034
 # hardening — the boring, important basics every Proxmox host should have.
 
 MODULE_SUMMARY="Key-only SSH, working update repos, safer network defaults"

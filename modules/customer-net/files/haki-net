@@ -10,6 +10,7 @@
 #   haki-net remove <host-port>             stop publishing it
 #   haki-net list                           published ports
 #   haki-net check [ingress-file]           validate the rules without applying them
+#   haki-net show [ingress-file]            print the rules it would load
 #   haki-net edge                           the address allowed to reach published ports
 #
 # Settings (from /etc/haki/haki.conf): HAKI_BRIDGE, HAKI_HOST_IP, HAKI_TENANT_BRIDGE,
@@ -88,6 +89,7 @@ EOF
 case ${1:-apply} in
   check) [[ -n ${2:-} ]] && CONF=$2; [[ -e $CONF ]] || CONF=/dev/null
          render | nft -c -f - && echo "haki-net: rules valid"; exit ;;
+  show)  [[ -n ${2:-} ]] && CONF=$2; [[ -e $CONF ]] || CONF=/dev/null; render; exit ;;
   list)  grep -vsE '^\s*(#|$)' "$CONF" || echo "(no published ports)"; exit 0 ;;
   edge)  echo "${EDGE:-none (set HAKI_EDGE_IP; until then no port is reachable)}"; exit 0 ;;
 esac
@@ -104,7 +106,7 @@ case ${1:-apply} in
   remove)
     [[ $# -eq 2 ]] && valid_port "$2" || die "usage: haki-net remove <host-port>"
     sed -i "/^$2 /d" "$CONF" ;;
-  *) die "unknown command: $1 (apply, add, remove, list, check, edge)" ;;
+  *) die "unknown command: $1 (apply, add, remove, list, check, show, edge)" ;;
 esac
 
 [[ -z $EDGE ]] || valid_ip "$EDGE" || die "HAKI_EDGE_IP='$EDGE' is not an IPv4 address"

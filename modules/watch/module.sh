@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=bash disable=SC2034
 # watch — health checks every 2 minutes, explained alerts in Discord.
 
 MODULE_SUMMARY="Health checks every 2 min, clear alerts in Discord, daily report"

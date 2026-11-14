@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=bash disable=SC2034
 # backup-usb — plug in a USB drive, every guest gets backed up, the drive unmounts itself.
 
 MODULE_SUMMARY="Plug in a USB drive → everything is backed up → safe to unplug"

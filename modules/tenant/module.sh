@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=bash disable=SC2034
 # tenant — create and manage containers for other people's apps on the customer network.
 
 MODULE_SUMMARY="Create, publish and remove containers for other people's apps"

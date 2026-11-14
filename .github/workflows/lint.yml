@@ -1,17 +1,36 @@
-name: Lint
+name: Checks
 
 on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
-  shellcheck:
+  lint:
+    name: Syntax and ShellCheck
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Syntax check
+      - name: Find the shell scripts
+        # Everything with a bash shebang or a shellcheck shell=bash header; never YAML or docs.
         run: |
-          for f in haki lib/*.sh modules/*/module.sh modules/*/files/*; do bash -n "$f" || exit 1; done
+          git ls-files | xargs grep -lE '^(#!/usr/bin/env bash|#!/bin/bash|# shellcheck shell=bash)' > scripts.txt
+          cat scripts.txt
+      - name: Syntax
+        run: xargs -n1 bash -n < scripts.txt
       - name: ShellCheck
-        run: |
-          shellcheck -S warning -x haki lib/common.sh modules/*/module.sh modules/*/files/*
+        run: xargs shellcheck -S warning -x < scripts.txt
+
+  smoke:
+    name: Smoke tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools the tests use
+        run: sudo apt-get install -y -qq nftables python3-yaml >/dev/null
+      - name: As a normal user
+        run: tests/smoke.sh
+      - name: As root (firewall rules; this runner is thrown away afterwards)
+        run: sudo env CI=true PATH="$PATH" tests/smoke.sh
