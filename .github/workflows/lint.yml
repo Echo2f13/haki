@@ -14,9 +14,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Find the shell scripts
-        # Everything with a bash shebang or a shellcheck shell=bash header; never YAML or docs.
+        # Files whose first line is a bash shebang or a shellcheck shell=bash header.
         run: |
-          git ls-files | xargs grep -lE '^(#!/usr/bin/env bash|#!/bin/bash|# shellcheck shell=bash)' > scripts.txt
+          git ls-files | while read -r f; do
+            head -1 "$f" | grep -qE '^(#!/usr/bin/env bash|#!/bin/bash|# shellcheck shell=bash)' && echo "$f"
+          done > scripts.txt
           cat scripts.txt
       - name: Syntax
         run: xargs -n1 bash -n < scripts.txt
@@ -31,6 +33,6 @@ jobs:
       - name: Tools the tests use
         run: sudo apt-get install -y -qq nftables python3-yaml >/dev/null
       - name: As a normal user
-        run: tests/smoke.sh
+        run: bash tests/smoke.sh
       - name: As root (firewall rules; this runner is thrown away afterwards)
-        run: sudo env CI=true PATH="$PATH" tests/smoke.sh
+        run: sudo env CI=true PATH="$PATH" bash tests/smoke.sh
