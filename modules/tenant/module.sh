@@ -79,21 +79,6 @@ need_tenant()  { [[ ${1:-} =~ ^[0-9]+$ ]] || die "which tenant? e.g. haki tenant
 
 plan_line() { awk -v p="$1" '$1 == p && $1 !~ /^#/ { print; exit }' "$PLANS" 2>/dev/null; }
 
-# Newest Debian standard template, downloaded once from Proxmox's template repository.
-pick_template() {
-  if [[ -n $HAKI_TENANT_TEMPLATE ]]; then echo "$HAKI_TENANT_TEMPLATE"; return; fi
-  local t
-  t=$(pveam list "$HAKI_SNIPPET_STORAGE" 2>/dev/null | awk '{ print $1 }' | sed -n 's#.*vztmpl/\(debian-[0-9]*-standard_.*\)#\1#p' | sort -V | tail -1)
-  [[ -n $t ]] && { echo "$t"; return; }
-  pveam update >/dev/null 2>&1
-  pveam available --section system | awk '{ print $2 }' | grep '^debian-[0-9]*-standard_' | sort -V | tail -1
-}
-pick_storage() {
-  if [[ -n $HAKI_TENANT_STORAGE ]]; then echo "$HAKI_TENANT_STORAGE"; return; fi
-  pvesm status --content rootdir 2>/dev/null | awk 'NR > 1 && $3 == "active" { print $1 }' | grep -m1 -E '^local-(lvm|zfs)$' \
-    || pvesm status --content rootdir 2>/dev/null | awk 'NR > 1 && $3 == "active" { print $1; exit }'
-}
-
 # --- commands ---------------------------------------------------------------------------------
 module_cmd_new() {
   local private=0 a args=()
@@ -142,7 +127,9 @@ module_cmd_new() {
   title "Ready"
   echo "  Shell inside it:    haki tenant shell $id     (or: pct enter $id)"
   echo "  Install their app:  apt update && apt install -y <what it needs>, then a systemd service"
-  if (( ! private )); then
+  if (( ! private )) && module_installed edge; then
+    echo "  Give it a hostname: haki edge add $name.<your domain> $id"
+  elif (( ! private )); then
     echo "  Give it a hostname: point your tunnel / reverse proxy at http://$HAKI_HOST_IP:$port"
     echo "                      e.g. cloudflared config.yml:  - hostname: $name.example.com"
     echo "                                                      service: http://$HAKI_HOST_IP:$port"
@@ -187,6 +174,8 @@ module_cmd_unpublish() {
   need_root; need_tenant "${1:-}"
   /usr/local/sbin/haki-net remove "$(host_port "$1")"
   ok "CT $1 is no longer published"
+  local h; h=$(awk -v u="http://$HAKI_HOST_IP:$(host_port "$1")" '$2 == u { printf "%s ", $1 }' /etc/haki/edge-routes.conf 2>/dev/null)
+  [[ -z $h ]] || note "These hostnames now show an error page: $h(haki edge remove <hostname>)"
 }
 
 module_cmd_remove() {
@@ -199,6 +188,10 @@ module_cmd_remove() {
   [[ $typed == "$name" ]] || { skip "names don't match; nothing deleted"; return 0; }
   run "stop it" pct stop "$id" || true
   run "delete it" pct destroy "$id" --purge 1 || die "pct destroy failed"
+  local h
+  for h in $(awk -v u="http://$HAKI_HOST_IP:$(host_port "$id")" '$2 == u { print $1 }' /etc/haki/edge-routes.conf 2>/dev/null); do
+    run "stop publishing https://$h" "$HAKI_ROOT/haki" edge remove "$h" || true
+  done
   if grep -q "^$(host_port "$id") " /etc/haki/ingress.conf 2>/dev/null; then
     run "unpublish its port" /usr/local/sbin/haki-net remove "$(host_port "$id")"
   fi

@@ -167,15 +167,18 @@ module_status() {
   else
     local cur; cur=$(edge_vm_ip)
     if [[ -n $cur && $cur != "$HAKI_EDGE_IP" ]]; then
-      warn "the edge VM ($HAKI_EDGE_VM) is now at $cur, but published apps only accept $HAKI_EDGE_IP."
+      warn "the edge ${HAKI_EDGE_CT:+container}${HAKI_EDGE_CT:-VM ($HAKI_EDGE_VM)} is at $cur, but published apps only accept $HAKI_EDGE_IP."
       note "Fix: haki customer-net edge $cur"
+    elif [[ -n $HAKI_EDGE_CT && $HAKI_EDGE_IP == "$HAKI_EDGE_ADDR" ]]; then ok "published apps accept traffic from $HAKI_EDGE_IP (edge container $HAKI_EDGE_CT)"
     else ok "published apps accept traffic from $HAKI_EDGE_IP${HAKI_EDGE_VM:+ (VM $HAKI_EDGE_VM)}"; fi
   fi
   return $rc
 }
 
-# The edge VM's current LAN address, found by its MAC (works with DHCP). Empty if unknown.
+# The edge machine's current LAN address: the edge container's fixed one (module 'edge'), or the
+# edge VM's, found by its MAC (works with DHCP). Empty if unknown.
 edge_vm_ip() {
+  if [[ -n $HAKI_EDGE_CT && -n $HAKI_EDGE_ADDR ]]; then printf '%s' "$HAKI_EDGE_ADDR"; return 0; fi
   [[ -n $HAKI_EDGE_VM ]] && command -v qm >/dev/null || return 0
   local mac ip
   mac=$(qm config "$HAKI_EDGE_VM" 2>/dev/null | sed -n 's/^net0: [a-z0-9]*=\([0-9A-Fa-f:]\{17\}\),.*/\1/p' | tr 'A-F' 'a-f')
@@ -192,7 +195,9 @@ edge_vm_ip() {
 module_cmd_edge() {
   local ip=${1:-}
   if [[ -z $ip ]]; then
-    if [[ -n $HAKI_EDGE_VM ]]; then
+    if [[ -n $HAKI_EDGE_CT && -n $HAKI_EDGE_ADDR ]]; then
+      ip=$HAKI_EDGE_ADDR; ok "the edge container ($HAKI_EDGE_CT) is at $ip"
+    elif [[ -n $HAKI_EDGE_VM ]]; then
       step "Looking for VM $HAKI_EDGE_VM on $HAKI_BRIDGE"
       ip=$(edge_vm_ip)
       [[ -n $ip ]] && ok "VM $HAKI_EDGE_VM is at $ip" || warn "couldn't find VM $HAKI_EDGE_VM's address (is it running?)"

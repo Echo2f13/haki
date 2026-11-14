@@ -91,7 +91,7 @@ cmd_list() {
     printf '  %-14s %-22s %s\n' "$m" "$state" "$MODULE_SUMMARY"
   done
   echo
-  note "Details: haki info <module>     Coming next: edge, ollama-gpu, notes-sync"
+  note "Details: haki info <module>     Coming next: ollama-gpu, notes-sync"
 }
 
 cmd_info() { [[ -n ${1:-} ]] || die "usage: haki info <module>"; print_module_info "$1"; }

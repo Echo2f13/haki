@@ -38,10 +38,10 @@ when something is wrong — and why.
 |---|---|
 | [`customer-net`](modules/customer-net/module.sh) | A separate network for guests you host. They get the internet and nothing else: not your LAN, not the host, not each other, no outbound mail. Only your reverse proxy / tunnel can reach a published app. |
 | [`tenant`](modules/tenant/module.sh) | `haki tenant new 202 priya-shop small` → an isolated container with its own IP and CPU/RAM/disk limits, starting on boot. Plus `list`, `publish`, `shell` and `remove`. |
+| [`edge`](modules/edge/module.sh) | Public https addresses with **no port forwarding**, behind CGNAT too: a tiny container runs a Cloudflare Tunnel. `haki edge add shop.example.com 202` publishes a tenant, DNS record included. |
 
-See [docs/hosting.md](docs/hosting.md). Coming next: a public website behind Cloudflare Tunnel
-with no port forwarding (`edge`), an ollama API with GPU passthrough (`ollama-gpu`), and Obsidian
-sync over Tailscale (`notes-sync`).
+See [docs/hosting.md](docs/hosting.md). Coming next: an ollama API with GPU passthrough
+(`ollama-gpu`), and Obsidian sync over Tailscale (`notes-sync`).
 
 ## How it works
 
@@ -95,7 +95,7 @@ web UI, or a screen and keyboard). See [docs/safety.md](docs/safety.md).
 - [Getting started](docs/getting-started.md) — a fresh Proxmox install to alerts in Discord
 - [Configuration](docs/config.md) — every setting in `/etc/haki/haki.conf`
 - [Safety](docs/safety.md) — what haki will and won't do, and how to undo it
-- [Hosting other people's apps](docs/hosting.md) — customer-net and tenant, step by step
+- [Hosting other people's apps](docs/hosting.md) — customer-net, tenant and edge, step by step
 - [Writing a module](docs/writing-modules.md) — add your own building block
 
 ## License

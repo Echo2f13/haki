@@ -71,6 +71,7 @@ load_config() {
   HAKI_BACKUP_UUID='' HAKI_BACKUP_KEEP=4 HAKI_BACKUP_MIN_FREE_GB=150 HAKI_BACKUP_DUE_DAYS=7
   HAKI_TENANT_BRIDGE=vmbr1 HAKI_TENANT_SUBNET=10.10.0.0/24 HAKI_EDGE_IP='' HAKI_SNIPPET_STORAGE=local
   HAKI_TENANT_IDS=201-250 HAKI_TENANT_STORAGE='' HAKI_TENANT_TEMPLATE='' HAKI_TENANT_DNS="1.1.1.1 9.9.9.9"
+  HAKI_EDGE_CT='' HAKI_EDGE_ADDR='' HAKI_EDGE_TUNNEL=haki
   # shellcheck disable=SC1090
   [[ -r $HAKI_CONF ]] && source "$HAKI_CONF"
   return 0
@@ -158,3 +159,19 @@ default_bridge()  { ip route show default | awk '{ for (i = 1; i <= NF; i++) if 
 default_gateway() { ip route show default | awk '{ print $3; exit }'; }
 bridge_ip()       { ip -4 -o addr show "$1" 2>/dev/null | awk '{ split($4, a, "/"); print a[1]; exit }'; }
 root_disk()       { lsblk -sno NAME,TYPE "$(findmnt -no SOURCE /)" 2>/dev/null | awk '$2 == "disk" { gsub(/[^a-z0-9]/, "", $1); print $1; exit }'; }
+
+# --- containers -------------------------------------------------------------------------------
+# Newest Debian standard template, downloaded once from Proxmox's template repository.
+pick_template() {
+  if [[ -n $HAKI_TENANT_TEMPLATE ]]; then echo "$HAKI_TENANT_TEMPLATE"; return; fi
+  local t
+  t=$(pveam list "$HAKI_SNIPPET_STORAGE" 2>/dev/null | awk '{ print $1 }' | sed -n 's#.*vztmpl/\(debian-[0-9]*-standard_.*\)#\1#p' | sort -V | tail -1)
+  [[ -n $t ]] && { echo "$t"; return; }
+  pveam update >/dev/null 2>&1
+  pveam available --section system | awk '{ print $2 }' | grep '^debian-[0-9]*-standard_' | sort -V | tail -1
+}
+pick_storage() {
+  if [[ -n $HAKI_TENANT_STORAGE ]]; then echo "$HAKI_TENANT_STORAGE"; return; fi
+  pvesm status --content rootdir 2>/dev/null | awk 'NR > 1 && $3 == "active" { print $1 }' | grep -m1 -E '^local-(lvm|zfs)$' \
+    || pvesm status --content rootdir 2>/dev/null | awk 'NR > 1 && $3 == "active" { print $1; exit }'
+}

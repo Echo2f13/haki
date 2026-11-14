@@ -33,7 +33,7 @@ EVENTS=$STATE/events.log
 REMIND_SECS=$((12 * 3600))
 BOOT_GRACE=300          # after boot, give guests this long before their checks count
 # Settings come from /etc/haki/haki.conf (written by `haki init`); empty means "skip that check".
-HAKI_BRIDGE=vmbr0 HAKI_SITE_URL="" HAKI_EDGE_VM="" HAKI_EDGE_IP="" HAKI_OLLAMA_VM="" HAKI_OLLAMA_PORT=11434
+HAKI_BRIDGE=vmbr0 HAKI_SITE_URL="" HAKI_EDGE_VM="" HAKI_EDGE_IP="" HAKI_EDGE_CT="" HAKI_EDGE_ADDR="" HAKI_OLLAMA_VM="" HAKI_OLLAMA_PORT=11434
 HAKI_REPORT_HOUR=9 HAKI_CONFIRM_RUNS=2
 [[ -r /etc/haki/haki.conf ]] && source /etc/haki/haki.conf
 BRIDGE=$HAKI_BRIDGE
@@ -346,7 +346,8 @@ for id in $(qm list | awk 'NR > 1 { print $1 }'); do
 done
 
 # Published customer ports are only accepted from one address: HAKI_EDGE_IP (module customer-net),
-# or EDGE= in an older hand-installed haki-net.
+# or EDGE= in an older hand-installed haki-net. The edge container (module edge) has a fixed address.
+[[ -n $HAKI_EDGE_CT && -n $HAKI_EDGE_ADDR ]] && EDGE_IP=$HAKI_EDGE_ADDR
 haki_edge=${HAKI_EDGE_IP:-}
 [[ -n $haki_edge ]] || haki_edge=$(sed -n 's/^EDGE=\([0-9.]*\).*/\1/p' /usr/local/sbin/haki-net 2>/dev/null)
 if [[ -n $EDGE_IP && -n $haki_edge ]]; then
@@ -355,7 +356,7 @@ if [[ -n $EDGE_IP && -n $haki_edge ]]; then
     if grep -qsvE '^\s*(#|$)' /etc/haki/ingress.conf; then impact="Published customer sites won't load."
     else impact="No customer port is published yet, so nothing is affected right now."; fi
     SEV=warn report haki-net-edge fail "haki-net points at the wrong edge address" \
-         "The edge VM is at $EDGE_IP but haki-net only accepts customer traffic from $haki_edge. $impact" \
+         "The edge machine is at $EDGE_IP but haki-net only accepts customer traffic from $haki_edge. $impact" \
          "On the host: haki customer-net edge $EDGE_IP  (and give the edge VM a fixed address on the router)."
   fi
 fi
@@ -375,6 +376,18 @@ if [[ -r /etc/haki/services.conf ]]; then
       "pct exec $ctid -- journalctl -u $unit -n 50" \
       sh -c "pct exec $ctid -- systemctl is-active $unit || { pct exec $ctid -- journalctl -u $unit -n 1 --no-pager -o cat; exit 1; }"
   done < /etc/haki/services.conf
+fi
+
+# The edge container's Cloudflare Tunnel (module edge): connected, with at least one link to Cloudflare.
+tunnel_ready() {
+  pct exec "$HAKI_EDGE_CT" -- bash -c 'exec 3<>/dev/tcp/127.0.0.1/20241 && printf "GET /ready HTTP/1.0\r\n\r\n" >&3 && cat <&3' 2>/dev/null \
+    | grep -q '"readyConnections":[1-9]' || { echo "cloudflared has no connection to Cloudflare."; return 1; }
+}
+if [[ -n $HAKI_EDGE_CT ]] && pct status "$HAKI_EDGE_CT" 2>/dev/null | grep -q running \
+   && pct exec "$HAKI_EDGE_CT" -- test -s /etc/cloudflared/config.yml 2>/dev/null; then
+  if in_grace && ! tunnel_ready >/dev/null; then report edge-tunnel skip ""
+  else check edge-tunnel "The Cloudflare Tunnel is down" \
+         "Every site published with 'haki edge' is offline. Look at: haki edge logs" tunnel_ready; fi
 fi
 
 # --- host health ---------------------------------------------------------------------------

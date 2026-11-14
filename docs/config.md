@@ -62,4 +62,14 @@ matches the new drive.
 
 Other files: `/etc/haki/plans.conf` (tenant plans, one per line) and `/etc/haki/ingress.conf`
 (published ports: `<host port> <container ip> <container port>`, managed by `haki tenant publish`).
+
+## edge
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `HAKI_EDGE_CT` | asked (`120`) | The edge container's id. Set by `haki install edge`. |
+| `HAKI_EDGE_ADDR` | asked | Its fixed address on your LAN. Pick one outside your router's DHCP range. With `customer-net`, `HAKI_EDGE_IP` is set to it. |
+| `HAKI_EDGE_TUNNEL` | `haki` | The tunnel's name in your Cloudflare account. An existing tunnel with this name is reused. |
+
+Other file: `/etc/haki/edge-routes.conf` (`<hostname> <url>` per line, managed by `haki edge add/remove`).
 After changing the bridge or subnet, run `haki install customer-net` again.
