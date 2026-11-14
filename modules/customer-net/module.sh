@@ -117,9 +117,9 @@ iface $HAKI_TENANT_BRIDGE inet static
 	bridge-stp off
 	bridge-fd 0
 EOF
-  if planning; then plan "apply it with 'ifreload -a' (running VMs stay plugged in)"; return 0; fi
   if ip -4 -o addr show dev "$HAKI_TENANT_BRIDGE" 2>/dev/null | grep -q " $(cn_gateway)/"; then
     skip "$HAKI_TENANT_BRIDGE is already up"
+  elif planning; then plan "apply it with 'ifreload -a' (running VMs stay plugged in)"
   else
     run "bring up $HAKI_TENANT_BRIDGE (ifreload -a)" ifreload -a
   fi

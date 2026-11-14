@@ -141,7 +141,7 @@ module_install() {
   fi
 
   step "cloudflared inside it"
-  if ! planning && edge_exists && in_edge test -x /usr/bin/cloudflared; then skip "cloudflared installed ($(in_edge cloudflared --version 2>/dev/null | awk '{ print $3 }'))"
+  if edge_exists && in_edge test -x /usr/bin/cloudflared; then skip "cloudflared installed ($(in_edge cloudflared --version 2>/dev/null | awk '{ print $3 }'))"
   elif planning; then plan "install cloudflared from pkg.cloudflare.com, and unattended-upgrades to keep it updated"
   else
     run "turn off SSH inside it (you manage it from the host)" in_edge systemctl disable --now -q ssh.socket ssh.service || true
