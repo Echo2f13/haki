@@ -24,12 +24,15 @@ runcmd:
   - systemctl enable --now qemu-guest-agent
   - ufw default deny incoming
   - ufw default allow outgoing
-  - ufw allow from @LAN@ to any port 22 proto tcp comment 'haki: ssh from the LAN'
+  - ufw allow from @LAN@ to any port 22 proto tcp comment 'haki - ssh from the LAN'
 @UFW_ALLOW@
   - ufw --force enable
   # Driver before ollama, so ollama's installer finds it and doesn't fetch its own.
   - '[ "@GPU@" = none ] || ubuntu-drivers install'
   - curl -fsSL https://ollama.com/install.sh | sh
+  # During first boot systemd reports "starting", so the installer skips enabling the service.
+  - systemctl daemon-reload
+  - systemctl enable ollama
   - touch /var/lib/haki-ollama-ready
 power_state:
   mode: reboot

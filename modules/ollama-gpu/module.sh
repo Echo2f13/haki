@@ -106,7 +106,7 @@ render_user_data() {
   local gpu=$1 allow=$2 keys ufw='' a
   keys=$(grep -E '^(ssh|ecdsa|sk-)' "$3" | sed 's/^/      - /')
   [[ -n $keys ]] || die "no SSH public keys in $3"
-  for a in $allow; do ufw+="  - ufw allow from $a to any port $HAKI_OLLAMA_PORT proto tcp comment 'haki: ollama API'"$'\n'; done
+  for a in $allow; do ufw+="  - ufw allow from $a to any port $HAKI_OLLAMA_PORT proto tcp comment 'haki - ollama API'"$'\n'; done
   KEYS=$keys UFW=${ufw%$'\n'} PORT=$HAKI_OLLAMA_PORT LAN=$(lan_cidr) GPU=$gpu perl -pe '
       s/\@HOSTNAME\@/ollama/g; s/\@PORT\@/$ENV{PORT}/g; s/\@LAN\@/$ENV{LAN}/g; s/\@GPU\@/$ENV{GPU}/g;
       $_ = "$ENV{KEYS}\n" if /^\@SSH_KEYS\@$/; $_ = "$ENV{UFW}\n" if /^\@UFW_ALLOW\@$/;' \
@@ -214,7 +214,7 @@ create_vm() {
   if planning; then
     plan "download and verify the Ubuntu 24.04 cloud image into $IMG_DIR"
     plan "create VM $id 'ollama': ${HAKI_OLLAMA_CORES} cores (low priority), ${HAKI_OLLAMA_RAM} MB, ${HAKI_OLLAMA_DISK} GB on $storage, ${addr:-DHCP}, $( [[ $s == none ]] && echo "no GPU (CPU only)" || echo "GPU $s")"
-    plan "first boot (about 10 min): NVIDIA driver, ollama, firewall allowing $allow (+ SSH from $(lan_cidr))"
+    plan "first boot (about 10 min): $( [[ $s == none ]] || echo "NVIDIA driver, ")ollama, firewall allowing $allow (+ SSH from $(lan_cidr))"
     plan "set HAKI_OLLAMA_VM, HAKI_OLLAMA_ALLOW${addr:+, HAKI_OLLAMA_ADDR} in $HAKI_CONF"
     return 0
   fi
@@ -258,7 +258,7 @@ create_vm() {
   conf_set HAKI_OLLAMA_VM "$id"; conf_set HAKI_OLLAMA_ALLOW "$allow"; [[ -z $addr ]] || conf_set HAKI_OLLAMA_ADDR "$addr"
   run "start it" qm start "$id"
   title "Setting itself up"
-  echo "  First boot installs the NVIDIA driver and ollama, then reboots: about 10 minutes."
+  echo "  First boot installs $( [[ $s == none ]] || echo "the NVIDIA driver and ")ollama, then reboots: about 10 minutes."
   echo "  Follow along:  haki status ollama-gpu      Then:  haki ollama-gpu pull gemma2:2b"
 }
 
@@ -346,11 +346,13 @@ module_cmd_bench() {
   local r; r=$(API_TIMEOUT=600 API_PATH=/api/generate api -X POST -d "{\"model\":\"$m\",\"prompt\":\"Explain in one paragraph why the sky is blue.\",\"stream\":false,\"options\":{\"num_predict\":128,\"temperature\":0}}") \
     || die "the model didn't answer (does it fit in the VM's RAM? haki ollama-gpu models)"
   local ps; ps=$(api_get /api/ps)
-  R=$r PS=$ps M=$m perl -MJSON -e '
+  R=$r PS=$ps M=$m CPU=$([[ $HAKI_OLLAMA_GPU == none ]] && echo 1) perl -MJSON -e '
     my $r = decode_json($ENV{R}); my ($x) = grep { $_->{name} eq $ENV{M} } @{ decode_json($ENV{PS})->{models} };
     printf "  speed     %.1f tokens/s  (%d tokens in %.1f s; loading took %.1f s)\n",
       $r->{eval_count} / ($r->{eval_duration} / 1e9), $r->{eval_count}, $r->{eval_duration} / 1e9, ($r->{load_duration} // 0) / 1e9;
-    if ($x && $x->{size}) {
+    if ($x && $x->{size} && $ENV{CPU}) {
+      printf "  memory    %.1f GB, on the CPU (this VM has no GPU)\n", $x->{size} / 1e9;
+    } elsif ($x && $x->{size}) {
       my $p = 100 * $x->{size_vram} / $x->{size};
       printf "  memory    %.1f GB, %.0f%% of it on the GPU (%.1f GB VRAM)%s\n", $x->{size} / 1e9, $p, $x->{size_vram} / 1e9,
         $p >= 99 ? "" : $p > 0 ? " — the rest runs on the CPU, which is slower" : " — none: check the driver (haki ollama-gpu gpu)";
@@ -385,7 +387,7 @@ module_cmd_allow() {
   fi
   if [[ -z $a ]]; then in_vm ufw status | sed 's/^/  /'; return 0; fi
   [[ $a =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] || die "'$a' isn't an IPv4 address or range"
-  in_vm ufw allow from "$a" to any port "$HAKI_OLLAMA_PORT" proto tcp comment 'haki: ollama API' >/dev/null || die "ufw refused"
+  in_vm ufw allow from "$a" to any port "$HAKI_OLLAMA_PORT" proto tcp comment 'haki - ollama API' >/dev/null || die "ufw refused"
   conf_set HAKI_OLLAMA_ALLOW "$(printf '%s\n' $HAKI_OLLAMA_ALLOW "$a" | awk 'NF && !seen[$0]++' | paste -sd' ')"
   ok "$a may use the API"
 }
