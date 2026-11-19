@@ -56,8 +56,9 @@ Optional settings (see [config.md](config.md#discord-bot)): `HAKI_BOT_OWNERS`, `
 
 ## If something's off
 
-- **Commands don't appear:** the bot registers them when it connects, in every server it's in.
-  After inviting it, `systemctl restart haki-discord-bot`. Then reload Discord (Ctrl+R).
+- **Commands don't appear:** the bot registers them when it joins a server, and again in every
+  server each time it connects. Reload Discord (Ctrl+R). Still nothing: `haki discord-bot logs`,
+  then `systemctl restart haki-discord-bot`.
 - **"This bot only answers its owner":** you're not the application's owner; add your user id
   (Discord → Settings → Advanced → Developer Mode, then right-click yourself → Copy User ID) to
   `HAKI_BOT_OWNERS`.

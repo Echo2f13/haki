@@ -493,9 +493,21 @@ async def answer(dc, app_id, owners, d):
 async def gateway(dc, app_id, owners):
     import websockets  # Debian: python3-websockets
 
-    sess = {'id': None, 'seq': None, 'url': None}
+    sess = {'id': None, 'seq': None, 'url': None, 'user': ''}
     url = (await asyncio.to_thread(dc.call, 'GET', '/gateway/bot'))['url']
     delay = 1
+    cmds = [{'name': n, 'description': desc, 'type': 1} for n, desc in COMMANDS]
+    known = set()  # servers whose commands are registered
+
+    async def register(guild):
+        """Guild commands show up at once (global ones can take a while)."""
+        try:
+            await asyncio.to_thread(dc.call, 'PUT', f'/applications/{app_id}/guilds/{guild}/commands', cmds)
+            known.add(guild)
+            return True
+        except Exception as e:
+            log(f'could not register commands in server {guild}: {e}')
+            return False
     while True:
         target = (sess['url'] if sess['id'] else url) + '/?v=10&encoding=json'
         hb_task = None
@@ -520,7 +532,8 @@ async def gateway(dc, app_id, owners):
                 if sess['id']:
                     await ws.send(json.dumps({'op': 6, 'd': {'token': dc.token, 'session_id': sess['id'], 'seq': sess['seq']}}))
                 else:
-                    await ws.send(json.dumps({'op': 2, 'd': {'token': dc.token, 'intents': 0,
+                    # GUILDS (1): told when it's added to or removed from a server. Not a privileged intent.
+                    await ws.send(json.dumps({'op': 2, 'd': {'token': dc.token, 'intents': 1,
                                                              'properties': {'os': 'linux', 'browser': 'haki', 'device': 'haki'}}}))
                 async for raw in ws:
                     m = json.loads(raw)
@@ -529,14 +542,24 @@ async def gateway(dc, app_id, owners):
                     op, t = m['op'], m.get('t')
                     if op == 0 and t == 'READY':
                         sess.update(id=m['d']['session_id'], url=m['d']['resume_gateway_url'])
-                        me = m['d']['user']
+                        sess['user'] = m['d']['user'].get('username', '')
                         guilds = [g['id'] for g in m['d'].get('guilds', [])]
-                        cmds = [{'name': n, 'description': desc, 'type': 1} for n, desc in COMMANDS]
-                        for g in guilds:  # guild commands show up at once
-                            await asyncio.to_thread(dc.call, 'PUT', f'/applications/{app_id}/guilds/{g}/commands', cmds)
-                        save_state(connected=True, user=me.get('username'), guilds=len(guilds), since=int(time.time()))
-                        log(f'connected as {me.get("username")}, commands registered in {len(guilds)} server(s)')
+                        known.intersection_update(guilds)
+                        for g in guilds:
+                            await register(g)
+                        save_state(connected=True, user=sess['user'], guilds=len(known), since=int(time.time()))
+                        log(f'connected as {sess["user"]}, commands registered in {len(known)} server(s)')
                         delay = 1
+                    elif op == 0 and t == 'GUILD_CREATE' and m['d']['id'] not in known:
+                        # Added to a server while running (servers it was already in also arrive
+                        # here after READY; those are in `known` and skipped).
+                        if await register(m['d']['id']):
+                            save_state(guilds=len(known))
+                            log(f'added to server "{m["d"].get("name", "?")}"; commands registered ({len(known)} server(s))')
+                    elif op == 0 and t == 'GUILD_DELETE' and not m['d'].get('unavailable'):
+                        known.discard(m['d']['id'])
+                        save_state(guilds=len(known))
+                        log(f'removed from a server ({len(known)} left)')
                     elif op == 0 and t == 'RESUMED':
                         log('resumed')
                         delay = 1
