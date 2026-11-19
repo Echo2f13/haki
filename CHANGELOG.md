@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- `discord-bot`: slash commands about your server in Discord — `/status`, `/alerts`, `/site`
+  (checked live), `/guests`, `/host`, `/backup`, `/ollama`, `/notes`. Read-only and sandboxed: it
+  runs as its own user and only reads a snapshot root writes every minute. Answers only you.
+- New settings: `HAKI_BOT_OWNERS`, `HAKI_SITE_REPO`, `HAKI_NOTES_CT`.
+
 ## 0.2.0 — 2026-11-15
 
 **Hosting other people's apps**

@@ -66,6 +66,14 @@ if python3 -c 'import yaml' 2>/dev/null; then t "renders valid cloud-init, every
 else echo "  skip  cloud-init YAML check (needs python3 with PyYAML)"; fi
 t "a CPU-only VM skips the driver" cpu_only_skips_driver
 
+# --- discord-bot: the answers -----------------------------------------------------------------
+echo "discord-bot"
+py_parses() { local f; for f in modules/discord-bot/files/*; do python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f" || return 1; done; }
+if command -v python3 >/dev/null; then
+  t "its python scripts parse" py_parses
+  t "every command renders a valid embed" python3 tests/check-bot-answers.py modules/discord-bot/files/haki-discord-bot tests/fixtures/snapshot.json
+else echo "  skip  (needs python3)"; fi
+
 # --- customer-net: the firewall ----------------------------------------------------------------
 echo "customer-net: firewall rules"
 if [[ $EUID -eq 0 && ${CI:-} == true ]] && ! command -v pveversion >/dev/null && command -v nft >/dev/null; then

@@ -1,0 +1,607 @@
+#!/usr/bin/env python3
+"""haki-discord-bot: read-only slash commands about a haki server.
+
+    /status   everything at a glance          /host     CPU, RAM, disks, temperatures
+    /alerts   what's failing, last 7 days     /guests   VMs and containers
+    /site     your website, live              /backup   the USB backup
+    /ollama   models, GPU, live               /notes    Obsidian sync
+    /help
+
+It only reads: /run/haki-bot/snapshot.json (written by haki-snapshot as root every minute) and,
+live, your site and the ollama API. Nothing it does can change the server. It connects out to
+Discord's gateway, so no port is opened. Only the bot's owner (or HAKI_BOT_OWNERS) gets answers,
+and every answer is visible only to the person who asked.
+
+    haki-discord-bot                        run (systemd, as user haki-bot)
+    haki-discord-bot --render <cmd> [--snapshot FILE] [--offline] [--text]
+                                            print one answer without Discord (tests, terminal)
+
+The token comes from systemd (LoadCredential=token) and is never logged.
+Installed by `haki install discord-bot`; see modules/discord-bot in the haki repo.
+"""
+import asyncio
+import json
+import os
+import random
+import socket
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+VERSION = '1'
+API = 'https://discord.com/api/v10'
+SNAPSHOT = os.environ.get('HAKI_SNAPSHOT', '/run/haki-bot/snapshot.json')
+STATE = os.path.join(os.environ.get('RUNTIME_DIRECTORY', '/run/haki-discord-bot'), 'state.json')
+UA = f'DiscordBot (https://github.com/Echo2f13/haki, {VERSION})'
+GREEN, YELLOW, ORANGE, RED, GREY, BLUE = 0x2ECC71, 0xF1C40F, 0xE67E22, 0xE74C3C, 0x95A5A6, 0x3498DB
+EPHEMERAL = 64
+
+COMMANDS = [
+    ('status', 'Everything at a glance: problems, host, guests, site, backup'),
+    ('alerts', "What's failing right now, and incidents of the last 7 days"),
+    ('site', 'Your website, checked live: up, speed, certificate, tunnel, last deploy'),
+    ('guests', 'VMs and containers: state, CPU, memory, address'),
+    ('host', 'The Proxmox host: CPU, RAM, disks, temperatures, uptime'),
+    ('backup', 'The USB backup: when it last ran and what it saved'),
+    ('ollama', 'Local AI: models, what is loaded, GPU, checked live'),
+    ('notes', 'Obsidian sync: CouchDB, Tailscale and your devices'),
+    ('help', 'What each command shows'),
+]
+
+
+# --- formatting ---------------------------------------------------------------------------------
+def dur(s):
+    s = int(max(s, 0))
+    if s >= 86400:
+        return f'{s // 86400} d {s % 86400 // 3600} h'
+    if s >= 3600:
+        return f'{s // 3600} h {s % 3600 // 60} min'
+    return f'{(s + 59) // 60} min'
+
+
+def ago(ts, now=None):
+    if not ts:
+        return 'never'
+    return f'<t:{int(ts)}:R>'  # Discord shows it in the reader's time zone, and keeps it current
+
+
+def gb(b):
+    return f'{b / 1e9:.1f} GB' if b < 1e12 else f'{b / 1e12:.2f} TB'
+
+
+def bar(pct, width=10):
+    full = max(0, min(width, round(pct / 100 * width)))
+    return '█' * full + '░' * (width - full)
+
+
+def pct_icon(p, warn, bad):
+    return '🔴' if p >= bad else '🟡' if p >= warn else '🟢'
+
+
+def embed(title, color, desc='', fields=(), snap=None):
+    e = {'title': title[:256], 'color': color, 'description': desc[:4096]}
+    f = [{'name': n[:256], 'value': (v or '—')[:1024], 'inline': inline} for n, v, inline in fields if v is not None][:25]
+    if f:
+        e['fields'] = f
+    if snap:
+        age = int(time.time()) - snap.get('at', 0)
+        host = (snap.get('host') or {}).get('name', 'haki') if isinstance(snap.get('host'), dict) else 'haki'
+        e['footer'] = {'text': f'{host} · data from {dur(age)} ago' + (' ⚠ stale: is haki-snapshot.timer running?' if age > 300 else '')}
+    return e
+
+
+def err(section):
+    return isinstance(section, dict) and 'error' in section
+
+
+# --- live checks (run in a thread; each one has its own timeout) -----------------------------------
+def fetch(url, timeout=8, headers=None):
+    req = urllib.request.Request(url, headers={'User-Agent': 'haki-discord-bot', **(headers or {})})
+    t = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read(200_000)
+            return {'code': r.status, 'ms': round((time.monotonic() - t) * 1000), 'body': body, 'headers': dict(r.headers)}
+    except urllib.error.HTTPError as e:
+        return {'code': e.code, 'ms': round((time.monotonic() - t) * 1000), 'body': b'', 'headers': dict(e.headers)}
+    except Exception as e:
+        return {'code': 0, 'ms': round((time.monotonic() - t) * 1000), 'error': str(getattr(e, 'reason', e))[:200]}
+
+
+def cert_expiry(host, port=443):
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((host, port), timeout=6) as s, ctx.wrap_socket(s, server_hostname=host) as t:
+            return int(ssl.cert_time_to_seconds(t.getpeercert()['notAfter']))
+    except Exception:
+        return 0
+
+
+def api_json(url, timeout=6):
+    r = fetch(url, timeout)
+    if r['code'] != 200:
+        raise RuntimeError(r.get('error') or f'HTTP {r["code"]}')
+    return json.loads(r['body'])
+
+
+# --- the commands --------------------------------------------------------------------------------
+def problems(snap):
+    w = snap.get('watch') or {}
+    return [c for c in (w.get('checks') or []) if c['state'] in ('down', 'failing')] if not err(w) else []
+
+
+def cmd_status(snap, live):
+    h, w, guests, b, e = snap.get('host') or {}, snap.get('watch') or {}, snap.get('guests') or [], snap.get('backup'), snap.get('edge') or {}
+    down = [c for c in problems(snap) if c['state'] == 'down']
+    failing = [c for c in problems(snap) if c['state'] == 'failing']
+    if down:
+        title, color = f'🔴 {len(down)} problem{"s" * (len(down) > 1)}', RED
+    elif failing:
+        title, color = '🟡 Something failed once, waiting to confirm', YELLOW
+    else:
+        title, color = '🟢 All good', GREEN
+    desc = '\n'.join(f'• **{c["title"]}** (since {ago(c["since"])})' for c in down + failing) or 'Every check is passing.'
+    fields = []
+    if not err(h) and h:
+        mem_used = 100 * (1 - h['mem_avail'] / max(h['mem_total'], 1))
+        root_used = 100 * (1 - h['root_free'] / max(h['root_total'], 1))
+        temp = max(h['temps'].values()) if h.get('temps') else None
+        fields.append(('Host', f'up {dur(h["uptime"])}\nCPU {h["cpu_pct"]:.0f}% · RAM {mem_used:.0f}%\nroot disk {root_used:.0f}%'
+                       + (f' · {temp}°C' if temp else ''), True))
+    if isinstance(guests, list):
+        run = sum(g['status'] == 'running' for g in guests)
+        fields.append(('Guests', f'{run} of {len(guests)} running' + ''.join(
+            f'\n⚪ {g["kind"].upper()} {g["id"]} {g["name"]} is {g["status"]}' for g in guests if g['status'] != 'running')[:600], True))
+    site = next((c for c in (w.get('checks') or []) if c['id'] == 'site-public'), None) if not err(w) else None
+    if e.get('site_url'):
+        host = urllib.parse.urlsplit(e['site_url']).hostname
+        line = f'{"🟢 up" if site and site["state"] == "ok" else "🔴 down" if site else "· not checked"}'
+        if e.get('ct'):
+            line += f'\ntunnel: {e.get("tunnel_connections", 0)} link(s)'
+        fields.append((host or 'Site', line, True))
+    if isinstance(b, dict) and not err(b):
+        age = (snap['at'] - b['last_success']) / 86400 if b['last_success'] else 999
+        fields.append(('Backup', f'{pct_icon(age, b["due_days"], b["due_days"] + 7)} {ago(b["last_success"])}', True))
+    if not err(w) and w:
+        hb = snap['at'] - w.get('heartbeat', 0)
+        fields.append(('haki-watch', f'{"🟢" if hb < 600 else "🔴"} last check {ago(w.get("heartbeat"))}'
+                       + (f'\n{w["queued"]} alert(s) waiting to send' if w.get('queued') else ''), True))
+    return embed(title, color, desc, fields, snap)
+
+
+def cmd_alerts(snap, live):
+    w = snap.get('watch') or {}
+    if err(w) or not w:
+        return embed('Alerts', GREY, "haki-watch isn't installed or its state couldn't be read.", snap=snap)
+    now_bad = problems(snap)
+    desc = '\n'.join(f'{"🔴" if c["state"] == "down" else "🟡"} **{c["title"]}**\n  since {ago(c["since"])}, '
+                     f'{c["fails"]} failed check(s) in a row' for c in now_bad) or '🟢 Nothing is failing right now.'
+    icons = {'down': '🔴', 'recovered': '🟢', 'offline': '🔌', 'ipchange': '🔀'}
+    events = [ev for ev in w.get('events') or [] if ev['kind'] in icons]
+    blips = sum(ev['kind'] == 'blip' for ev in w.get('events') or [])
+    hist = '\n'.join(f'{icons[ev["kind"]]} <t:{ev["at"]}:f> ' + (f'{ev["id"].replace("vm-", "VM ")} moved: ' if ev['kind'] == 'ipchange' else '')
+                     + ev['text'] for ev in events[-12:]) or 'No incidents.'
+    if blips:
+        hist += f'\n· {blips} one-off blip(s) ignored (failed once, fine on the next check)'
+    return embed('🚨 Alerts' if now_bad else '✅ Alerts', RED if now_bad else GREEN, desc,
+                 [('Last 7 days', hist[-1024:], False)], snap)
+
+
+def cmd_site(snap, live):
+    e = snap.get('edge') or {}
+    url = e.get('site_url', '')
+    if not url:
+        return embed('Website', GREY, 'No site set. Add HAKI_SITE_URL to /etc/haki/haki.conf.', snap=snap)
+    parts = urllib.parse.urlsplit(url)
+    home = f'{parts.scheme}://{parts.netloc}/'
+    fields, color, desc = [], GREEN, ''
+    if live:
+        r = fetch(home)
+        ok = r['code'] == 200
+        color = GREEN if ok and r['ms'] < 1500 else YELLOW if ok else RED
+        desc = (f'🟢 **up**, answered in {r["ms"]} ms' if ok else
+                f'🔴 **{"not responding" if not r["code"] else "HTTP " + str(r["code"])}**'
+                + (f' ({r.get("error")})' if r.get('error') else '')
+                + (' (Cloudflare can\'t reach the tunnel)' if r['code'] == 530 else ''))
+        cf = r.get('headers', {}).get('cf-ray', '')
+        if cf:
+            desc += f'\nvia Cloudflare ({cf.split("-")[-1]})'
+        exp = cert_expiry(parts.hostname)
+        if exp:
+            days = (exp - time.time()) / 86400
+            fields.append(('Certificate', f'{pct_icon(-days, -14, -3)} valid until <t:{exp}:D> ({days:.0f} days)', True))
+        if url != home:
+            v = fetch(url)
+            try:
+                info = json.loads(v['body'])
+                sha, built, run = info.get('sha', ''), info.get('builtAt', ''), info.get('run', '')
+                line = f'`{sha[:7]}`' if sha else ''
+                if built:
+                    t = int(datetime.fromisoformat(built.replace('Z', '+00:00')).timestamp())
+                    line += f' built <t:{t}:R>'
+                if e.get('site_repo') and sha:
+                    line += f'\n[commit](https://github.com/{e["site_repo"]}/commit/{sha})'
+                    if run:
+                        line += f' · [deploy run](https://github.com/{e["site_repo"]}/actions/runs/{run})'
+                fields.append(('Deployed', line or '—', True))
+            except Exception:
+                fields.append(('Health URL', f'HTTP {v["code"]}', True))
+    w = snap.get('watch') or {}
+    chk = next((c for c in (w.get('checks') or []) if c['id'] == 'site-public'), None) if not err(w) else None
+    if chk:
+        fields.append(('haki-watch', '🟢 passing' if chk['state'] == 'ok' else f'🔴 failing since {ago(chk["since"])}', True))
+    if e.get('ct'):
+        n = e.get('tunnel_connections', 0)
+        fields.append(('Cloudflare Tunnel', f'{"🟢" if n else "🔴"} {n} connection(s) from CT {e["ct"]}', True))
+    if e.get('vm'):
+        g = next((g for g in snap.get('guests') or [] if str(g['id']) == str(e['vm'])), None) if isinstance(snap.get('guests'), list) else None
+        if g:
+            fields.append(('Web server', f'{"🟢" if g["status"] == "running" else "🔴"} VM {g["id"]} {g["name"]} {g["status"]}'
+                           + (f'\n{g["ip"]}' if g.get('ip') else '') + f'\nRAM {gb(g["mem"])} / {gb(g["maxmem"])}', True))
+    if e.get('routes'):
+        fields.append(('Other hostnames (haki edge)', '\n'.join(f'{r["host"]} → {r["to"]}' for r in e['routes']), False))
+    return embed(f'🌐 {parts.hostname}', color, desc, fields, snap)
+
+
+def cmd_guests(snap, live):
+    guests = snap.get('guests')
+    if err(guests) or not isinstance(guests, list):
+        return embed('Guests', GREY, f'Could not read guests: {(guests or {}).get("error", "no data")}', snap=snap)
+    lines = []
+    for g in guests:
+        icon = '🟢' if g['status'] == 'running' else '⚪'
+        line = f'{icon} **{g["kind"].upper()} {g["id"]} {g["name"]}**'
+        if g['status'] == 'running':
+            mp = 100 * g['mem'] / max(g['maxmem'], 1)
+            line += f'\n  CPU {g["cpu"]:.0f}% of {g["cpus"]} · RAM {gb(g["mem"])}/{gb(g["maxmem"])} ({mp:.0f}%) · up {dur(g["uptime"])}'
+            if g.get('ip'):
+                line += f'\n  {g["ip"]}'
+        else:
+            line += f' ({g["status"]})'
+        lines.append(line)
+    run = sum(g['status'] == 'running' for g in guests)
+    return embed(f'🖥️ Guests · {run} of {len(guests)} running', GREEN if run == len(guests) else YELLOW, '\n'.join(lines), snap=snap)
+
+
+def cmd_host(snap, live):
+    h = snap.get('host') or {}
+    if err(h) or not h:
+        return embed('Host', GREY, f'Could not read the host: {h.get("error", "no data")}', snap=snap)
+    mem_used = h['mem_total'] - h['mem_avail']
+    mp = 100 * mem_used / max(h['mem_total'], 1)
+    swap_used = h['swap_total'] - h['swap_free']
+    fields = [
+        ('CPU', f'{h["cpu_pct"]:.0f}% · load {" ".join(f"{x:.2f}" for x in h["load"])}\n{h["cpus"]} × {h["cpu_model"]}', False),
+        ('Memory', f'{pct_icon(mp, 85, 95)} `{bar(mp)}` {gb(mem_used)} of {gb(h["mem_total"])}'
+                   + (f'\nswap {gb(swap_used)} of {gb(h["swap_total"])}' if h['swap_total'] else ''), False),
+    ]
+    disks = []
+    rp = 100 * (1 - h['root_free'] / max(h['root_total'], 1))
+    disks.append(f'{pct_icon(rp, 75, 85)} `{bar(rp)}` **root** {rp:.0f}% of {gb(h["root_total"])}')
+    st = snap.get('storage')
+    if isinstance(st, list):
+        for s in st:
+            if s.get('total') and s['storage'] != 'local':
+                p = 100 * s['used'] / s['total']
+                disks.append(f'{pct_icon(p, 70, 80)} `{bar(p)}` **{s["storage"]}** {p:.0f}% of {gb(s["total"])}')
+    fields.append(('Storage', '\n'.join(disks), False))
+    if h.get('temps'):
+        fields.append(('Temperatures', ' · '.join(f'{k} {v}°C' for k, v in sorted(h['temps'].items(), key=lambda kv: -kv[1])), False))
+    w = snap.get('watch') or {}
+    smart = next((c for c in (w.get('checks') or []) if c['id'] == 'host-ssd'), None) if not err(w) else None
+    health = [f'{"🔴 failed services: " + ", ".join(h["failed_units"]) if h["failed_units"] else "🟢 no failed services"}']
+    if smart:
+        health.append('🟢 SSD SMART passed' if smart['state'] == 'ok' else '🔴 SSD SMART check failing')
+    fields.append(('Health', '\n'.join(health), True))
+    fields.append(('Uptime', f'{dur(h["uptime"])}\nsince <t:{snap["at"] - h["uptime"]}:f>', True))
+    fields.append(('Software', f'Proxmox VE {h.get("pve") or "?"}\nkernel {h["kernel"]}', True))
+    color = RED if h['failed_units'] or mp > 95 or rp > 85 else GREEN
+    return embed(f'🏠 {h["name"]}', color, '', fields, snap)
+
+
+def cmd_backup(snap, live):
+    b = snap.get('backup')
+    if b is None:
+        return embed('Backup', GREY, "The USB backup (module backup-usb) isn't installed.", snap=snap)
+    if err(b):
+        return embed('Backup', GREY, f'Could not read the backup state: {b["error"]}', snap=snap)
+    age = (snap['at'] - b['last_success']) / 86400 if b['last_success'] else None
+    if age is None:
+        title, color, desc = '💾 Backup · never ran', RED, 'No successful backup yet. Plug in the backup drive.'
+    else:
+        late = age >= b['due_days']
+        title = f'💾 Backup · {"due" if late else "up to date"}'
+        color = (RED if age >= b['due_days'] + 7 else YELLOW) if late else GREEN
+        desc = f'Last good backup {ago(b["last_success"])} (<t:{b["last_success"]}:f>).'
+        if late:
+            desc += f'\nIt\'s been {age:.0f} days: plug in the drive; it backs up and unmounts by itself.'
+    fields = [('What it saved', '\n'.join(b['guests']) or '—', True),
+              ('Result', b['result'].replace('INFO: ', '') or '—', True),
+              ('Drive', '🔌 plugged in' if b['drive_present'] else 'not plugged in (that\'s normal between backups)', True)]
+    if b['last_failure'] and b['last_failure'] > (b['last_success'] or 0):
+        fields.append(('Last failure', f'🔴 {ago(b["last_failure"])}: haki backup-usb log', False))
+    return embed(title, color, desc, fields, snap)
+
+
+def cmd_ollama(snap, live):
+    o = snap.get('ollama')
+    if o is None:
+        return embed('ollama', GREY, "No ollama VM is set (module ollama-gpu).", snap=snap)
+    if err(o):
+        return embed('ollama', GREY, o['error'], snap=snap)
+    g = next((g for g in snap.get('guests') or [] if str(g['id']) == str(o['vm'])), None) if isinstance(snap.get('guests'), list) else None
+    fields = []
+    if g:
+        fields.append(('VM', f'{"🟢" if g["status"] == "running" else "🔴"} {g["id"]} {g["name"]} {g["status"]}\n'
+                       f'RAM {gb(g["mem"])} / {gb(g["maxmem"])}', True))
+    if not live:
+        return embed('🤖 ollama', BLUE, f'API at {o["ip"]}:{o["port"]} (not checked: offline)', fields, snap)
+    base = f'http://{o["ip"]}:{o["port"]}'
+    try:
+        ver = api_json(f'{base}/api/version')['version']
+        tags = api_json(f'{base}/api/tags').get('models', [])
+        ps = api_json(f'{base}/api/ps').get('models', [])
+    except Exception as e:
+        return embed('🤖 ollama · not answering', RED, f'The API at {base} didn\'t answer: {e}\nOn the host: haki status ollama-gpu', fields, snap)
+    loaded = {m['name']: m for m in ps}
+    lines = []
+    for m in sorted(tags, key=lambda m: m.get('size', 0)):
+        d = m.get('details') or {}
+        line = f'**{m["name"]}** {gb(m.get("size", 0))} {d.get("parameter_size", "")} {d.get("quantization_level", "")}'.strip()
+        if m['name'] in loaded:
+            x = loaded[m['name']]
+            p = 100 * x.get('size_vram', 0) / max(x.get('size', 1), 1)
+            line += f'\n  ⚡ loaded, {p:.0f}% on the GPU'
+        lines.append(line)
+    gpu = o.get('gpu')
+    fields.append(('GPU', 'none (CPU only)' if gpu == 'none' else f'passed through ({gpu or "auto"})', True))
+    fields.append(('API', f'ollama {ver}\n{o["ip"]}:{o["port"]}', True))
+    return embed(f'🤖 ollama · {len(tags)} model(s)', GREEN, '\n'.join(lines) or 'No models yet: haki ollama-gpu pull gemma2:2b',
+                 fields, snap)
+
+
+def cmd_notes(snap, live):
+    n = snap.get('notes')
+    if n is None:
+        return embed('Notes sync', GREY, 'No notes container set (HAKI_NOTES_CT in /etc/haki/haki.conf).', snap=snap)
+    if err(n):
+        return embed('Notes sync', GREY, n['error'], snap=snap)
+    if n.get('status') != 'running':
+        return embed('📝 Notes sync · down', RED, f'Container {n["ct"]} is {n.get("status")}.', snap=snap)
+    sv = n.get('services', {})
+    healthy = all(v == 'active' for v in sv.values())
+    devices = n.get('devices') or []
+    dl = []
+    for d in devices:
+        if d['online']:
+            dl.append(f'🟢 {d["name"]} ({d["os"]})')
+        else:
+            seen = d.get('last_seen', '')
+            try:
+                t = int(datetime.fromisoformat(seen.replace('Z', '+00:00')).timestamp())
+                seen = f', seen <t:{t}:R>' if t > 0 else ''
+            except Exception:
+                seen = ''
+            dl.append(f'⚪ {d["name"]} ({d["os"]}{seen})')
+    fields = [('Services', '\n'.join(f'{"🟢" if v == "active" else "🔴"} {k} {v}' for k, v in sv.items()), True),
+              ('Address', n.get('address', '?') + '\n(only inside your tailnet)', True),
+              ('Devices', '\n'.join(dl) or n.get('tailscale_error', 'none'), False)]
+    return embed(f'📝 Notes sync · {"healthy" if healthy else "problem"}', GREEN if healthy else RED,
+                 f'CT {n["ct"]}: CouchDB for Obsidian LiveSync, reachable only through Tailscale.', fields, snap)
+
+
+def cmd_help(snap, live):
+    return embed('haki commands', BLUE, 'Read-only: nothing here can change the server. Answers are only visible to you.\n\n'
+                 + '\n'.join(f'**/{n}**: {d}' for n, d in COMMANDS), snap=snap)
+
+
+HANDLERS = {n: globals()[f'cmd_{n}'] for n, _ in COMMANDS}
+
+
+def load_snapshot(path=SNAPSHOT):
+    with open(path) as f:
+        return json.load(f)
+
+
+def render(name, path=SNAPSHOT, live=True):
+    try:
+        snap = load_snapshot(path)
+    except Exception as e:
+        return embed('No data yet', GREY, f'Could not read the snapshot ({e}).\nOn the host: systemctl status haki-snapshot.timer')
+    try:
+        return HANDLERS[name](snap, live)
+    except Exception as e:
+        return embed(f'/{name} failed', RED, f'{type(e).__name__}: {e}', snap=snap)
+
+
+def as_text(e):
+    """An answer as plain text for a terminal: Discord's <t:…> timestamps become local times."""
+    import re
+
+    def stamp(m):
+        t = int(m.group(1))
+        return f'{dur(abs(time.time() - t))} ago' if m.group(2) == 'R' else time.strftime('%d %b %Y %H:%M', time.localtime(t))
+    out = [e['title'], e.get('description', '')]
+    for f in e.get('fields', []):
+        out += ['', f'[{f["name"]}]', f['value']]
+    if e.get('footer'):
+        out += ['', e['footer']['text']]
+    text = '\n'.join(x for x in out if x)
+    return re.sub(r'\*\*|`', '', re.sub(r'<t:(\d+):([a-zA-Z])>', stamp, text))
+
+
+# --- Discord ---------------------------------------------------------------------------------------
+class Discord:
+    def __init__(self, token):
+        self.token = token
+
+    def call(self, method, path, body=None, auth=True):
+        data = json.dumps(body).encode() if body is not None else None
+        for _ in range(3):
+            req = urllib.request.Request(API + path, data=data, method=method, headers={
+                'User-Agent': UA, 'Content-Type': 'application/json', **({'Authorization': f'Bot {self.token}'} if auth else {})})
+            try:
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    raw = r.read()
+                    return json.loads(raw) if raw else None
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    time.sleep(float(json.loads(e.read() or b'{}').get('retry_after', 1)) + 0.2)
+                    continue
+                raise RuntimeError(f'{method} {path.split("?")[0]}: HTTP {e.code} {e.read()[:200]!r}') from None
+        raise RuntimeError(f'{method} {path}: rate limited')
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def save_state(**kw):
+    try:
+        old = {}
+        if os.path.exists(STATE):
+            with open(STATE) as f:
+                old = json.load(f)
+        old.update(kw)
+        with open(STATE + '.tmp', 'w') as f:
+            json.dump(old, f)
+        os.replace(STATE + '.tmp', STATE)
+    except OSError:
+        pass
+
+
+async def answer(dc, app_id, owners, d):
+    user = (d.get('member') or {}).get('user') or d.get('user') or {}
+    name = (d.get('data') or {}).get('name', '')
+    if user.get('id') not in owners:
+        await asyncio.to_thread(dc.call, 'POST', f'/interactions/{d["id"]}/{d["token"]}/callback',
+                                {'type': 4, 'data': {'content': 'This bot only answers its owner.', 'flags': EPHEMERAL}}, False)
+        log(f'refused /{name} from user {user.get("id")}')
+        return
+    # Answer "thinking…" at once (Discord allows 3 s), then fill in the real answer.
+    await asyncio.to_thread(dc.call, 'POST', f'/interactions/{d["id"]}/{d["token"]}/callback', {'type': 5, 'data': {'flags': EPHEMERAL}}, False)
+    e = await asyncio.to_thread(render, name) if name in HANDLERS else embed('Unknown command', GREY, f'/{name}')
+    await asyncio.to_thread(dc.call, 'PATCH', f'/webhooks/{app_id}/{d["token"]}/messages/@original', {'embeds': [e]}, False)
+    save_state(last_command=name, last_command_at=int(time.time()))
+    log(f'/{name}')
+
+
+async def gateway(dc, app_id, owners):
+    import websockets  # Debian: python3-websockets
+
+    sess = {'id': None, 'seq': None, 'url': None}
+    url = (await asyncio.to_thread(dc.call, 'GET', '/gateway/bot'))['url']
+    delay = 1
+    while True:
+        target = (sess['url'] if sess['id'] else url) + '/?v=10&encoding=json'
+        hb_task = None
+        try:
+            async with websockets.connect(target, max_size=2 ** 22, open_timeout=20) as ws:
+                hello = json.loads(await ws.recv())
+                interval = hello['d']['heartbeat_interval'] / 1000
+                acked = {'ok': True}
+
+                async def heartbeat():
+                    await asyncio.sleep(interval * random.random())
+                    while True:
+                        if not acked['ok']:
+                            log('no heartbeat ack; reconnecting')
+                            await ws.close(4000)
+                            return
+                        acked['ok'] = False
+                        await ws.send(json.dumps({'op': 1, 'd': sess['seq']}))
+                        await asyncio.sleep(interval)
+
+                hb_task = asyncio.create_task(heartbeat())
+                if sess['id']:
+                    await ws.send(json.dumps({'op': 6, 'd': {'token': dc.token, 'session_id': sess['id'], 'seq': sess['seq']}}))
+                else:
+                    await ws.send(json.dumps({'op': 2, 'd': {'token': dc.token, 'intents': 0,
+                                                             'properties': {'os': 'linux', 'browser': 'haki', 'device': 'haki'}}}))
+                async for raw in ws:
+                    m = json.loads(raw)
+                    if m.get('s') is not None:
+                        sess['seq'] = m['s']
+                    op, t = m['op'], m.get('t')
+                    if op == 0 and t == 'READY':
+                        sess.update(id=m['d']['session_id'], url=m['d']['resume_gateway_url'])
+                        me = m['d']['user']
+                        guilds = [g['id'] for g in m['d'].get('guilds', [])]
+                        cmds = [{'name': n, 'description': desc, 'type': 1} for n, desc in COMMANDS]
+                        for g in guilds:  # guild commands show up at once
+                            await asyncio.to_thread(dc.call, 'PUT', f'/applications/{app_id}/guilds/{g}/commands', cmds)
+                        save_state(connected=True, user=me.get('username'), guilds=len(guilds), since=int(time.time()))
+                        log(f'connected as {me.get("username")}, commands registered in {len(guilds)} server(s)')
+                        delay = 1
+                    elif op == 0 and t == 'RESUMED':
+                        log('resumed')
+                        delay = 1
+                    elif op == 0 and t == 'INTERACTION_CREATE' and m['d'].get('type') == 2:
+                        task = asyncio.create_task(answer(dc, app_id, owners, m['d']))
+                        task.add_done_callback(lambda t: t.exception() and log(f'answer failed: {t.exception()}'))
+                    elif op == 1:
+                        await ws.send(json.dumps({'op': 1, 'd': sess['seq']}))
+                    elif op == 7:
+                        log('Discord asked to reconnect')
+                        break
+                    elif op == 9:
+                        if not m.get('d'):
+                            sess['id'] = None
+                        await asyncio.sleep(1 + 4 * random.random())
+                        break
+                    elif op == 11:
+                        acked['ok'] = True
+        except websockets.ConnectionClosed as e:
+            code = e.rcvd.code if e.rcvd else None
+            if code in (4004, 4010, 4011, 4012, 4013, 4014):
+                save_state(connected=False, error=f'Discord closed the connection: {code}')
+                raise SystemExit(f'Discord refused the bot (close code {code}); check the token: haki discord-bot token')
+            if code in (4007, 4009):
+                sess['id'] = None
+            log(f'connection closed ({code}); reconnecting')
+        except (OSError, asyncio.TimeoutError, websockets.WebSocketException) as e:
+            log(f'connection problem: {e}; retrying in {delay}s')
+            save_state(connected=False)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 120)
+        finally:
+            if hb_task:
+                hb_task.cancel()
+
+
+def read_token():
+    cred = os.environ.get('CREDENTIALS_DIRECTORY')
+    if cred and os.path.exists(f'{cred}/token'):
+        with open(f'{cred}/token') as f:
+            return f.read().strip()
+    return os.environ.get('HAKI_BOT_TOKEN', '').strip()
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] == '--render':
+        name = args[1] if len(args) > 1 else 'status'
+        path = args[args.index('--snapshot') + 1] if '--snapshot' in args else SNAPSHOT
+        e = render(name, path, live='--offline' not in args)
+        print(as_text(e) if '--text' in args else json.dumps(e, ensure_ascii=False, indent=2))
+        return
+    token = read_token()
+    if not token:
+        raise SystemExit('no bot token: haki discord-bot token')
+    dc = Discord(token)
+    app = dc.call('GET', '/oauth2/applications/@me')
+    owners = set(os.environ.get('HAKI_BOT_OWNERS', '').replace(',', ' ').split())
+    if not owners:
+        team = app.get('team')
+        owners = {m['user']['id'] for m in team['members']} if team else {app['owner']['id']}
+    save_state(app_id=app['id'], owners=len(owners), connected=False, error='')
+    log(f'haki-discord-bot {VERSION}: app {app["name"]}, answering {len(owners)} owner(s)')
+    asyncio.run(gateway(dc, app['id'], owners))
+
+
+if __name__ == '__main__':
+    main()

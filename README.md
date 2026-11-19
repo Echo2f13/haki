@@ -31,6 +31,7 @@ when something is wrong — and why.
 | [`watch`](modules/watch/module.sh) | Checks every 2 minutes and posts **explained** alerts to Discord: DOWN only after two failed checks, RECOVERED with the downtime, "server back online — it was a power cut", and a daily report. |
 | [`backup-usb`](modules/backup-usb/module.sh) | Plug in a USB drive → every VM and container is backed up → the drive unmounts → unplug. Status in Proxmox Notes and Discord. |
 | [`nic-watchdog`](modules/nic-watchdog/module.sh) | Brings the host's network back when the router stops answering, without unplugging your VMs. |
+| [`discord-bot`](modules/discord-bot/module.sh) | Ask your server from Discord: `/status`, `/alerts`, `/site` (checked live: speed, certificate, last deploy), `/guests`, `/host`, `/backup`, `/ollama`, `/notes`. Read-only, sandboxed, answers only you. See [docs/discord-bot.md](docs/discord-bot.md). |
 
 **Hosting other people's apps** — a friend's Discord bot, a small site, a side project:
 
@@ -105,6 +106,7 @@ web UI, or a screen and keyboard). See [docs/safety.md](docs/safety.md).
 - [Safety](docs/safety.md) — what haki will and won't do, and how to undo it
 - [Hosting other people's apps](docs/hosting.md) — customer-net, tenant and edge, step by step
 - [Local AI on your GPU](docs/ollama.md) — ollama-gpu: passthrough, models, benchmarks
+- [Ask your server from Discord](docs/discord-bot.md) — discord-bot: the commands, setup, why it's safe
 - [Writing a module](docs/writing-modules.md) — add your own building block
 
 ## Security

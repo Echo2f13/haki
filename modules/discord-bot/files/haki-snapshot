@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""haki-snapshot: what the haki Discord bot shows, collected as root once a minute.
+
+Writes /run/haki-bot/snapshot.json (mode 0640, group haki-bot). The bot runs as its own user
+with no access to Proxmox; this file is all it sees of the host. A section that fails records
+{"error": ...} and the rest still gets written.
+
+    haki-snapshot            write the snapshot
+    haki-snapshot --print    print it instead
+
+Installed by `haki install discord-bot`; see modules/discord-bot in the haki repo.
+"""
+import glob
+import grp
+import json
+import os
+import shlex
+import socket
+import subprocess
+import sys
+import time
+
+OUT_DIR = '/run/haki-bot'
+OUT = f'{OUT_DIR}/snapshot.json'
+WATCH = '/var/lib/haki-watch'
+BACKUP = '/var/lib/haki-backup'
+NOW = int(time.time())
+
+
+def conf():
+    """haki.conf as a dict (KEY="value" lines)."""
+    c = {}
+    try:
+        with open('/etc/haki/haki.conf') as f:
+            for line in f:
+                line = line.strip()
+                if '=' in line and not line.startswith('#'):
+                    k, v = line.split('=', 1)
+                    try:
+                        v = ' '.join(shlex.split(v))
+                    except ValueError:
+                        pass
+                    c[k.strip()] = v
+    except OSError:
+        pass
+    return c
+
+
+def sh(*cmd, timeout=15):
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip().splitlines()[-1:] or f'{cmd[0]} failed')
+    return r.stdout
+
+
+def read(path, default=''):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def num(path):
+    try:
+        return int(read(path, '0') or 0)
+    except ValueError:
+        return 0
+
+
+def pkg_version(name):
+    try:
+        return sh('dpkg-query', '-W', '-f', '${Version}', name).strip()
+    except Exception:
+        return ''
+
+
+# pvesh and pct start Perl and take about a second each; this runs every minute, so the
+# guests, storage and container calls go through one pvesh call and the lxc tools instead.
+_RES = None
+
+
+def resources():
+    global _RES
+    if _RES is None:
+        _RES = json.loads(sh('pvesh', 'get', '/cluster/resources', '--output-format', 'json'))
+    return _RES
+
+
+def ct_status(ct):
+    try:
+        return sh('lxc-info', '-n', str(ct), '-sH', timeout=5).strip().lower()
+    except Exception:
+        return 'unknown'
+
+
+def section(fn):
+    try:
+        return fn()
+    except Exception as e:  # one broken section never hides the others
+        return {'error': str(e)[:300]}
+
+
+C = conf()
+NODE = socket.gethostname()
+
+
+def host():
+    mem = {}
+    for line in read('/proc/meminfo').splitlines():
+        k, v = line.split(':', 1)
+        mem[k] = int(v.split()[0]) * 1024
+
+    def cpu_times():
+        f = [int(x) for x in read('/proc/stat').splitlines()[0].split()[1:]]
+        return sum(f), f[3] + f[4]
+    t1, i1 = cpu_times()
+    time.sleep(0.5)
+    t2, i2 = cpu_times()
+    model = next((l.split(':', 1)[1].strip() for l in read('/proc/cpuinfo').splitlines() if l.startswith('model name')), '')
+
+    temps = {}
+    for h in glob.glob('/sys/class/hwmon/hwmon*'):
+        vals = [num(p) for p in glob.glob(f'{h}/temp*_input')]
+        if vals and max(vals) > 0:
+            temps[read(f'{h}/name') or os.path.basename(h)] = round(max(vals) / 1000)
+
+    st = os.statvfs('/')
+    failed = sh('systemctl', '--failed', '--no-legend', '--plain').split()
+    return {
+        'name': NODE,
+        'pve': pkg_version('pve-manager'),
+        'kernel': os.uname().release,
+        'uptime': int(float(read('/proc/uptime').split()[0])),
+        'load': [float(x) for x in read('/proc/loadavg').split()[:3]],
+        'cpu_model': model, 'cpus': os.cpu_count(),
+        'cpu_pct': round(100 * (1 - (i2 - i1) / max(t2 - t1, 1)), 1),
+        'mem_total': mem.get('MemTotal', 0), 'mem_avail': mem.get('MemAvailable', 0),
+        'swap_total': mem.get('SwapTotal', 0), 'swap_free': mem.get('SwapFree', 0),
+        'root_total': st.f_blocks * st.f_frsize, 'root_free': st.f_bavail * st.f_frsize,
+        'temps': temps,
+        'failed_units': [u for u in failed if '.' in u],
+    }
+
+
+def storage():
+    out = []
+    for s in resources():
+        if s.get('type') == 'storage' and s.get('node') == NODE:
+            out.append({'storage': s.get('storage'), 'type': s.get('plugintype'), 'used': s.get('disk', 0),
+                        'total': s.get('maxdisk', 0), 'active': s.get('status') == 'available', 'content': s.get('content', '')})
+    return sorted(out, key=lambda s: s['storage'])
+
+
+def guests():
+    out = []
+    for g in resources():
+        if g.get('type') not in ('qemu', 'lxc') or g.get('template'):
+            continue
+        gid, kind = g['vmid'], 'vm' if g['type'] == 'qemu' else 'ct'
+        ip = read(f'{WATCH}/ip-{gid}') if kind == 'vm' else ''
+        if kind == 'ct' and g.get('status') == 'running':
+            try:
+                ips = [a for a in sh('lxc-info', '-n', str(gid), '-iH', timeout=5).split() if '.' in a and not a.startswith('127.')]
+                ips.sort(key=lambda a: a.startswith('100.') and 64 <= int(a.split('.')[1]) <= 127)  # Tailscale (100.64/10) last
+                ip = ips[0] if ips else ''
+            except Exception:
+                pass
+        out.append({'id': gid, 'kind': kind, 'name': g.get('name', ''), 'status': g.get('status'),
+                    'cpu': round(100 * g.get('cpu', 0), 1), 'cpus': g.get('maxcpu'),
+                    'mem': g.get('mem', 0), 'maxmem': g.get('maxmem', 0), 'uptime': g.get('uptime', 0),
+                    'tags': g.get('tags', ''), 'ip': ip})
+    return sorted(out, key=lambda g: g['id'])
+
+
+def checks():
+    """haki-watch's check states. Files not updated for 15 min belong to things that are gone."""
+    out = []
+    for f in sorted(glob.glob(f'{WATCH}/checks/*')):
+        if NOW - os.path.getmtime(f) > 900:
+            continue
+        lines = read(f).splitlines() + ['', '']
+        st, first, fails, _ = (lines[0].split() + ['0'] * 4)[:4]
+        out.append({'id': os.path.basename(f), 'state': st, 'since': int(first), 'fails': int(fails), 'title': lines[1]})
+    events = []
+    for line in read(f'{WATCH}/events.log').splitlines():
+        p = line.split(' ', 3)
+        if len(p) == 4 and NOW - int(p[0]) < 7 * 86400:
+            events.append({'at': int(p[0]), 'kind': p[1], 'id': p[2], 'text': p[3]})
+    return {'checks': out, 'events': events[-60:],
+            'heartbeat': num(f'{WATCH}/heartbeat'),
+            'queued': len(glob.glob(f'{WATCH}/queue/*.json')),
+            'webhook': 'HAKI_DISCORD_WEBHOOK=https' in read('/etc/haki/alerts.env')}
+
+
+def backup():
+    if not os.path.exists('/usr/local/sbin/haki-usb-backup'):
+        return None
+    log = read(f'{BACKUP}/last-run.log').splitlines()
+    done = [l.split('Finished Backup of ', 1)[1] for l in log if 'Finished Backup of' in l]
+    uuid = C.get('HAKI_BACKUP_UUID', '')
+    return {'last_success': num(f'{BACKUP}/last-success'), 'last_failure': num(f'{BACKUP}/last-failure'),
+            'guests': done, 'result': next((l for l in reversed(log) if 'job finished' in l or 'ERROR' in l), ''),
+            'drive_present': bool(uuid) and os.path.exists(f'/dev/disk/by-uuid/{uuid}'),
+            'due_days': int(C.get('HAKI_BACKUP_DUE_DAYS', 7) or 7)}
+
+
+def in_ct(ct, *cmd, timeout=10):
+    return sh('lxc-attach', '-n', str(ct), '--', *cmd, timeout=timeout)
+
+
+def edge():
+    ct, vm = C.get('HAKI_EDGE_CT', ''), C.get('HAKI_EDGE_VM', '')
+    e = {'site_url': C.get('HAKI_SITE_URL', ''), 'site_repo': C.get('HAKI_SITE_REPO', ''), 'vm': vm,
+         'vm_ip': read(f'{WATCH}/ip-{vm}') if vm else '', 'ct': ct, 'routes': []}
+    for line in read('/etc/haki/edge-routes.conf').splitlines():
+        p = line.split()
+        if len(p) >= 2 and not p[0].startswith('#'):
+            e['routes'].append({'host': p[0], 'to': p[1]})
+    if ct and ct_status(ct) == 'running':
+        try:
+            r = in_ct(ct, 'bash', '-c', 'exec 3<>/dev/tcp/127.0.0.1/20241 && printf "GET /ready HTTP/1.0\\r\\n\\r\\n" >&3 && cat <&3')
+            e['tunnel_connections'] = json.loads(r[r.index('{'):]).get('readyConnections', 0)
+        except Exception:
+            e['tunnel_connections'] = 0
+    return e
+
+
+def ollama():
+    vm = C.get('HAKI_OLLAMA_VM', '')
+    if not vm:
+        return None
+    return {'vm': vm, 'ip': C.get('HAKI_OLLAMA_ADDR', '') or read(f'{WATCH}/ip-{vm}'),
+            'port': C.get('HAKI_OLLAMA_PORT', '11434'), 'gpu': C.get('HAKI_OLLAMA_GPU', '')}
+
+
+def notes():
+    ct = C.get('HAKI_NOTES_CT', '')
+    if not ct:
+        return None
+    n = {'ct': ct, 'status': ct_status(ct)}
+    if n['status'] != 'running':
+        return n
+    n['services'] = {}
+    for u in ('couchdb', 'tailscaled'):  # is-active exits non-zero when down, so not through sh()
+        r = subprocess.run(['lxc-attach', '-n', ct, '--', 'systemctl', 'is-active', u], capture_output=True, text=True, timeout=10)
+        n['services'][u] = r.stdout.strip() or 'unknown'
+    try:
+        ts = json.loads(in_ct(ct, 'tailscale', 'status', '--json'))
+        n['address'] = 'https://' + ts['Self']['DNSName'].rstrip('.')
+        n['devices'] = sorted(({'name': p.get('HostName', '?'), 'os': p.get('OS', ''), 'online': bool(p.get('Online')),
+                                'last_seen': p.get('LastSeen', '')} for p in (ts.get('Peer') or {}).values()),
+                              key=lambda d: (not d['online'], d['name'].lower()))
+    except Exception as e:
+        n['tailscale_error'] = str(e)[:200]
+    return n
+
+
+def main():
+    snap = {'version': 1, 'at': NOW, 'host': section(host), 'storage': section(storage),
+            'guests': section(guests), 'watch': section(checks), 'backup': section(backup),
+            'edge': section(edge), 'ollama': section(ollama), 'notes': section(notes)}
+    data = json.dumps(snap, separators=(',', ':'))
+    if '--print' in sys.argv:
+        print(json.dumps(snap, indent=2))
+        return
+    try:
+        gid = grp.getgrnam('haki-bot').gr_gid
+    except KeyError:
+        gid = 0
+    os.makedirs(OUT_DIR, exist_ok=True)
+    os.chown(OUT_DIR, 0, gid)
+    os.chmod(OUT_DIR, 0o750)
+    tmp = f'{OUT}.tmp'
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640), 'w') as f:
+        f.write(data)
+    os.chown(tmp, 0, gid)
+    os.replace(tmp, OUT)
+
+
+if __name__ == '__main__':
+    main()

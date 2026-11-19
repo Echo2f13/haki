@@ -77,3 +77,14 @@ Other files: `/etc/haki/plans.conf` (tenant plans, one per line) and `/etc/haki/
 
 Other file: `/etc/haki/edge-routes.conf` (`<hostname> <url>` per line, managed by `haki edge add/remove`).
 After changing the bridge or subnet, run `haki install customer-net` again.
+
+## discord-bot
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `HAKI_BOT_OWNERS` | empty (the application's owner) | Discord user ids, space-separated, who get answers. Everyone else is told no. |
+| `HAKI_SITE_REPO` | empty | `owner/repo` of your site on GitHub, so `/site` links the deployed commit and its run. It reads `sha`, `builtAt` and `run` from `HAKI_SITE_URL` if that answers JSON. |
+| `HAKI_NOTES_CT` | empty | Container running CouchDB + Tailscale for Obsidian sync; `/notes` shows it. |
+
+The bot token is in `/etc/haki/discord-bot.token` (root, 0600), set by `haki discord-bot token`.
+After changing a setting: `systemctl restart haki-discord-bot`.
