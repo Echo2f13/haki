@@ -160,8 +160,24 @@ check() {
 
 in_grace() { (( UPTIME < BOOT_GRACE )); }
 
+# --- guests, read directly --------------------------------------------------------
+# qm and pct start Perl and take ~0.7 s per call; a run needed ~27 of them (18 s of CPU every
+# 2 minutes). The same facts come straight from /etc/pve, the pid files and the lxc tools.
+# guest_ids <qemu-server|lxc>: ids of this node's VMs or containers.
+guest_ids() { local f; for f in /etc/pve/"$1"/*.conf; do [[ -e $f ]] || continue; f=${f##*/}; echo "${f%.conf}"; done | sort -n; }
+# guest_conf <qemu-server|lxc> <id>: the current config, without snapshot / pending sections.
+guest_conf() { sed '/^\[/,$d' "/etc/pve/$1/$2.conf" 2>/dev/null; }
+vm_conf() { guest_conf qemu-server "$1"; }
+ct_conf() { guest_conf lxc "$1"; }
+vm_running() { local p; p=$(cat "/var/run/qemu-server/$1.pid" 2>/dev/null) && kill -0 "$p" 2>/dev/null; }
+ct_state() { local s; s=$(lxc-info -n "$1" -sH 2>/dev/null) || s=unknown; echo "${s,,}"; }
+ct_running() { [[ $(ct_state "$1") == running ]] || { echo "status: $(ct_state "$1")"; return 1; }; }
+in_ct() { local id=$1; shift; lxc-attach -n "$id" -- "$@"; }
+# svc_active <ct> <unit>: prints the state; when it's down, also the unit's last log line.
+svc_active() { in_ct "$1" systemctl is-active "$2" || { in_ct "$1" journalctl -u "$2" -n 1 --no-pager -o cat; return 1; }; }
+
 # --- guests on the LAN, found by MAC ----------------------------------------------
-vm_mac() { qm config "$1" | sed -n 's/^net0: [a-z0-9]*=\([0-9A-Fa-f:]\{17\}\),.*/\1/p' | tr 'A-F' 'a-f'; }
+vm_mac() { vm_conf "$1" | sed -n 's/^net0: [a-z0-9]*=\([0-9A-Fa-f:]\{17\}\),.*/\1/p' | tr 'A-F' 'a-f'; }
 # neigh_ips <mac>: IPv4 addresses the neighbour table has for this MAC, freshest first.
 neigh_ips() {
   ip -4 neigh show dev "$BRIDGE" | awk -v m="$1" '$2 == "lladdr" && tolower($3) == m {
@@ -214,13 +230,13 @@ print_status() {
 
 daily_report() {
   local guests="" id name st ip down="" f s first _a _b title blips incidents last age_days
-  for id in $(qm list | awk 'NR > 1 { print $1 }'); do
-    name=$(qm config "$id" | awk '/^name:/ { print $2 }'); st=$(qm status "$id" | awk '{ print $2 }')
+  for id in $(guest_ids qemu-server); do
+    name=$(vm_conf "$id" | awk '/^name:/ { print $2 }'); st=stopped; vm_running "$id" && st=running
     ip=$(cat "$STATE/ip-$id" 2>/dev/null || echo "?")
     guests+="VM $id $name — $st, $ip"$'\n'
   done
-  for id in $(pct list | awk 'NR > 1 { print $1 }'); do
-    name=$(pct config "$id" | awk '/^hostname:/ { print $2 }'); st=$(pct status "$id" | awk '{ print $2 }')
+  for id in $(guest_ids lxc); do
+    name=$(ct_conf "$id" | awk '/^hostname:/ { print $2 }'); st=$(ct_state "$id")
     guests+="CT $id $name — $st"$'\n'
   done
   for f in "$CHECKS"/*; do
@@ -312,18 +328,19 @@ fi
 
 # --- VMs ----------------------------------------------------------------------------------
 EDGE_IP=""
-for id in $(qm list | awk 'NR > 1 { print $1 }'); do
-  qm config "$id" | grep -q '^onboot: 1' || continue
-  name=$(qm config "$id" | awk '/^name:/ { print $2 }')
-  if ! qm status "$id" | grep -q running; then
-    report "vm-$id" fail "VM $id ($name) is not running" "$(qm status "$id")" "Proxmox UI → $id → Start, then look at its Tasks log."
+for id in $(guest_ids qemu-server); do
+  conf=$(vm_conf "$id")
+  grep -q '^onboot: 1' <<<"$conf" || continue
+  name=$(awk '/^name:/ { print $2 }' <<<"$conf")
+  if ! vm_running "$id"; then
+    report "vm-$id" fail "VM $id ($name) is not running" "status: stopped" "Proxmox UI → $id → Start, then look at its Tasks log."
     continue
   fi
   report "vm-$id" ok "VM $id ($name) is not running"
 
   # A "systemctl restart networking" leaves fwpr<id>p0 detached from the bridge while VMs keep running.
   port=fwpr${id}p0
-  qm config "$id" | grep -q '^net0:.*firewall=1' || port=tap${id}i0
+  grep -q '^net0:.*firewall=1' <<<"$conf" || port=tap${id}i0
   master=$(ip -o link show "$port" 2>/dev/null | grep -o 'master [^ ]*' | cut -d' ' -f2)
   if [[ $master == "$BRIDGE" ]]; then report "vm-$id-port" ok "VM $id ($name) is unplugged from the network"
   else report "vm-$id-port" fail "VM $id ($name) is unplugged from the network" \
@@ -362,29 +379,29 @@ if [[ -n $EDGE_IP && -n $haki_edge ]]; then
 fi
 
 # --- containers and customer services ------------------------------------------------------
-for id in $(pct list | awk 'NR > 1 { print $1 }'); do
-  pct config "$id" | grep -q '^onboot: 1' || continue
-  name=$(pct config "$id" | awk '/^hostname:/ { print $2 }')
-  check "ct-$id" "Container $id ($name) is not running" "Proxmox UI → $id → Start" \
-    sh -c "pct status $id | grep -q running || { pct status $id; exit 1; }"
+for id in $(guest_ids lxc); do
+  conf=$(ct_conf "$id")
+  grep -q '^onboot: 1' <<<"$conf" || continue
+  name=$(awk '/^hostname:/ { print $2 }' <<<"$conf")
+  check "ct-$id" "Container $id ($name) is not running" "Proxmox UI → $id → Start" ct_running "$id"
 done
 if [[ -r /etc/haki/services.conf ]]; then
   while read -r ctid unit; do
     [[ -z $ctid || $ctid == \#* ]] && continue
-    if in_grace && ! pct exec "$ctid" -- systemctl is-active --quiet "$unit" 2>/dev/null; then report "svc-$ctid-$unit" skip ""; continue; fi
+    if in_grace && ! in_ct "$ctid" systemctl is-active --quiet "$unit" 2>/dev/null; then report "svc-$ctid-$unit" skip ""; continue; fi
     check "svc-$ctid-$unit" "Service $unit in container $ctid is down" \
       "pct exec $ctid -- journalctl -u $unit -n 50" \
-      sh -c "pct exec $ctid -- systemctl is-active $unit || { pct exec $ctid -- journalctl -u $unit -n 1 --no-pager -o cat; exit 1; }"
+      svc_active "$ctid" "$unit"
   done < /etc/haki/services.conf
 fi
 
 # The edge container's Cloudflare Tunnel (module edge): connected, with at least one link to Cloudflare.
 tunnel_ready() {
-  pct exec "$HAKI_EDGE_CT" -- bash -c 'exec 3<>/dev/tcp/127.0.0.1/20241 && printf "GET /ready HTTP/1.0\r\n\r\n" >&3 && cat <&3' 2>/dev/null \
+  in_ct "$HAKI_EDGE_CT" bash -c 'exec 3<>/dev/tcp/127.0.0.1/20241 && printf "GET /ready HTTP/1.0\r\n\r\n" >&3 && cat <&3' 2>/dev/null \
     | grep -q '"readyConnections":[1-9]' || { echo "cloudflared has no connection to Cloudflare."; return 1; }
 }
-if [[ -n $HAKI_EDGE_CT ]] && pct status "$HAKI_EDGE_CT" 2>/dev/null | grep -q running \
-   && pct exec "$HAKI_EDGE_CT" -- test -s /etc/cloudflared/config.yml 2>/dev/null; then
+if [[ -n $HAKI_EDGE_CT ]] && [[ $(ct_state "$HAKI_EDGE_CT") == running ]] \
+   && in_ct "$HAKI_EDGE_CT" test -s /etc/cloudflared/config.yml 2>/dev/null; then
   if in_grace && ! tunnel_ready >/dev/null; then report edge-tunnel skip ""
   else check edge-tunnel "The Cloudflare Tunnel is down" \
          "Every site published with 'haki edge' is offline. Look at: haki edge logs" tunnel_ready; fi

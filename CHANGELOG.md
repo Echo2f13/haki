@@ -6,6 +6,8 @@
   (checked live), `/guests`, `/host`, `/backup`, `/ollama`, `/notes`. Read-only and sandboxed: it
   runs as its own user and only reads a snapshot root writes every minute. Answers only you.
 - New settings: `HAKI_BOT_OWNERS`, `HAKI_SITE_REPO`, `HAKI_NOTES_CT`.
+- `watch`: a run takes 0.3 s instead of ~18 s of CPU (every 2 minutes). It reads guest configs from
+  /etc/pve and asks lxc directly instead of starting `qm` / `pct` (Perl, ~0.7 s each) 27 times.
 
 ## 0.2.0 — 2026-11-15
 
